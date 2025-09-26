@@ -14,6 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from neo4j import Neo4jDriver
+from .neo4j_driver import Neo4jDriver  # noqa: F401
 
-__all__ = ['Neo4jDriver']
+try:
+    from .spanner_driver import SpannerDriver
+
+    _HAS_SPANNER = True
+except ImportError:
+    SpannerDriver = None  # type: ignore
+    _HAS_SPANNER = False
+
+__all__ = ['Neo4jDriver', 'SpannerDriver'] if _HAS_SPANNER else ['Neo4jDriver']
