@@ -78,7 +78,15 @@ def get_entity_edge_save_query(provider: GraphProvider, has_aoss: bool = False) 
                 SET e = removeKeyFromMap(removeKeyFromMap($edge_data, "fact_embedding"), "episodes")
                 SET e.fact_embedding = join([x IN coalesce($edge_data.fact_embedding, []) | toString(x) ], ",")
                 SET e.episodes = join($edge_data.episodes, ",")
-                RETURN $edge_data.uuid AS uuid
+                RETURN e.uuid AS uuid
+            """
+        case GraphProvider.SPANNER:
+            return """
+                MATCH (source:Entity {uuid: $edge_data.source_uuid})
+                MATCH (target:Entity {uuid: $edge_data.target_uuid})
+                MATCH (source)-[e:RELATES_TO {uuid: $edge_data.uuid}]->(target)
+                SET e = $edge_data
+                RETURN e.uuid AS uuid
             """
         case GraphProvider.KUZU:
             return """
@@ -161,6 +169,15 @@ def get_entity_edge_save_bulk_query(provider: GraphProvider, has_aoss: bool = Fa
                     e.invalid_at = $invalid_at,
                     e.attributes = $attributes
                 RETURN e.uuid AS uuid
+            """
+        case GraphProvider.SPANNER:
+            return """
+                UNWIND $entity_edges AS edge
+                MATCH (source:Entity {uuid: edge.source_node_uuid})
+                MATCH (target:Entity {uuid: edge.target_node_uuid})
+                MATCH (source)-[r:RELATES_TO {uuid: edge.uuid}]->(target)
+                SET r = edge
+                RETURN edge.uuid AS uuid
             """
         case _:
             save_embedding_query = (
@@ -258,6 +275,14 @@ def get_community_edge_save_query(provider: GraphProvider) -> str:
                 SET
                     e.group_id = $group_id,
                     e.created_at = $created_at
+                RETURN e.uuid AS uuid
+            """
+        case GraphProvider.SPANNER:
+            return """
+                MATCH (community:Community {uuid: $community_uuid})
+                MATCH (node {uuid: $entity_uuid})
+                MATCH (community)-[e:HAS_MEMBER {uuid: $uuid}]->(node)
+                SET e = {uuid: $uuid, group_id: $group_id, created_at: $created_at}
                 RETURN e.uuid AS uuid
             """
         case _:  # Neo4j

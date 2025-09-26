@@ -23,6 +23,13 @@ INDEX_TO_LABEL_KUZU_MAPPING = {
     'episode_content': 'Episodic',
     'edge_name_and_fact': 'RelatesToNode_',
 }
+# Mapping from fulltext index names to Spanner node labels
+INDEX_TO_LABEL_SPANNER_MAPPING = {
+    'node_name_and_summary': 'Entity',
+    'community_name': 'Community',
+    'episode_content': 'Episodic',
+    'edge_name_and_fact': 'RELATES_TO',
+}
 
 
 def get_range_indices(provider: GraphProvider) -> list[LiteralString]:
@@ -44,6 +51,16 @@ def get_range_indices(provider: GraphProvider) -> list[LiteralString]:
 
     if provider == GraphProvider.KUZU:
         return []
+
+    if provider == GraphProvider.SPANNER:
+        # Spanner Graph uses different index syntax
+        # These would be property graph schema definitions rather than indexes
+        return [
+            # Property graph schema creation for Spanner would be done via DDL
+            # This is a placeholder - actual Spanner graph schema would be different
+            'CREATE PROPERTY GRAPH IF NOT EXISTS graphiti_graph',
+            'CREATE OR REPLACE PROPERTY GRAPH graphiti_graph NODE TABLES (Entity, Episodic, Community) EDGE TABLES (RELATES_TO, MENTIONS, HAS_MEMBER)',
+        ]
 
     return [
         'CREATE INDEX entity_uuid IF NOT EXISTS FOR (n:Entity) ON (n.uuid)',
@@ -115,6 +132,14 @@ def get_fulltext_indices(provider: GraphProvider) -> list[LiteralString]:
             "CALL CREATE_FTS_INDEX('RelatesToNode_', 'edge_name_and_fact', ['name', 'fact']);",
         ]
 
+    if provider == GraphProvider.SPANNER:
+        # Spanner Graph fulltext search is integrated into GQL queries
+        # No separate fulltext index creation - it's handled by the property graph schema
+        return [
+            # Placeholder - Spanner handles fulltext search differently in GQL queries
+            '-- Spanner Graph fulltext search is handled in GQL queries directly',
+        ]
+
     return [
         """CREATE FULLTEXT INDEX episode_content IF NOT EXISTS
         FOR (e:Episodic) ON EACH [e.content, e.source, e.source_description, e.group_id]""",
@@ -136,6 +161,11 @@ def get_nodes_query(name: str, query: str, limit: int, provider: GraphProvider) 
         label = INDEX_TO_LABEL_KUZU_MAPPING[name]
         return f"CALL QUERY_FTS_INDEX('{label}', '{name}', {query}, TOP := $limit)"
 
+    if provider == GraphProvider.SPANNER:
+        label = INDEX_TO_LABEL_SPANNER_MAPPING[name]
+        # Spanner GQL uses text search in WHERE clauses
+        return f'MATCH (n:{label}) WHERE SEARCH(n, {query}) RETURN n LIMIT {limit}'
+
     return f'CALL db.index.fulltext.queryNodes("{name}", {query}, {{limit: $limit}})'
 
 
@@ -146,6 +176,11 @@ def get_vector_cosine_func_query(vec1, vec2, provider: GraphProvider) -> str:
 
     if provider == GraphProvider.KUZU:
         return f'array_cosine_similarity({vec1}, {vec2})'
+
+    if provider == GraphProvider.SPANNER:
+        # Spanner uses COSINE_DISTANCE which returns distance (lower is better)
+        # Convert to similarity by subtracting from 1
+        return f'(1 - COSINE_DISTANCE({vec1}, {vec2}))'
 
     return f'vector.similarity.cosine({vec1}, {vec2})'
 
@@ -158,5 +193,10 @@ def get_relationships_query(name: str, limit: int, provider: GraphProvider) -> s
     if provider == GraphProvider.KUZU:
         label = INDEX_TO_LABEL_KUZU_MAPPING[name]
         return f"CALL QUERY_FTS_INDEX('{label}', '{name}', cast($query AS STRING), TOP := $limit)"
+
+    if provider == GraphProvider.SPANNER:
+        label = INDEX_TO_LABEL_SPANNER_MAPPING[name]
+        # Spanner GQL relationship search
+        return f'MATCH ()-[r:{label}]-() WHERE SEARCH(r, $query) RETURN r LIMIT {limit}'
 
     return f'CALL db.index.fulltext.queryRelationships("{name}", $query, {{limit: $limit}})'
