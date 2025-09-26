@@ -22,7 +22,10 @@ from abc import ABC, abstractmethod
 from collections.abc import Coroutine
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from opensearchpy import AsyncOpenSearch
 
 from dotenv import load_dotenv
 
@@ -33,7 +36,7 @@ try:
 
     _HAS_OPENSEARCH = True
 except ImportError:
-    OpenSearch = None
+    AsyncOpenSearch = None  # type: ignore
     helpers = None
     _HAS_OPENSEARCH = False
 
@@ -172,7 +175,7 @@ class GraphDriver(ABC):
         ''  # Neo4j (default) syntax does not require a prefix for fulltext queries
     )
     _database: str
-    aoss_client: AsyncOpenSearch | None  # type: ignore
+    aoss_client: 'AsyncOpenSearch | None' = None  # type: ignore
 
     @abstractmethod
     def execute_query(self, cypher_query_: str, **kwargs: Any) -> Coroutine:
