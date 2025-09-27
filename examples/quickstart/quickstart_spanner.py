@@ -22,25 +22,20 @@ import asyncio
 import json
 import os
 from datetime import datetime, timezone
-from enum import Enum
 
 from graphiti_core.driver.spanner_driver import SpannerDriver
 from graphiti_core.graphiti import Graphiti
-
-
-class SourceType(Enum):
-    PODCAST = 'podcast'
-    NEWS_ARTICLE = 'news_article'
-    RESEARCH_PAPER = 'research_paper'
+from graphiti_core.llm_client.gemini_client import GeminiClient, LLMConfig
+from graphiti_core.embedder.gemini import GeminiEmbedder, GeminiEmbedderConfig
+from graphiti_core.cross_encoder.gemini_reranker_client import GeminiRerankerClient
+from graphiti_core.nodes import EpisodeType
 
 
 # Spanner configuration from environment variables or defaults
 spanner_project_id = os.getenv('SPANNER_PROJECT_ID', 'your-gcp-project')
 spanner_instance_id = os.getenv('SPANNER_INSTANCE_ID', 'graphiti-instance')
-spanner_database_id = os.getenv('SPANNER_DATABASE_ID', 'graphiti-db')
-aws_region = os.getenv('AWS_REGION', 'us-east-1')
-aws_service = os.getenv('AWS_SERVICE', 'es')
-
+spanner_database_id = os.getenv('SPANNER_DATABASE_ID', 'graphititest')
+google_gemini_api_key = os.getenv('GOOGLE_GEMINI_API_KEY', '')
 
 async def main():
     #################################################
@@ -57,7 +52,27 @@ async def main():
         spanner_database_id=spanner_database_id,
     )
 
-    graphiti = Graphiti(graph_driver=spanner_driver)
+    graphiti = Graphiti(
+        graph_driver=spanner_driver,
+        llm_client=GeminiClient(
+            config=LLMConfig(
+                api_key=google_gemini_api_key,
+                model="gemini-2.5-flash"
+            )
+        ),
+        embedder=GeminiEmbedder(
+            config=GeminiEmbedderConfig(
+                api_key=google_gemini_api_key,
+                embedding_model="gemini-embedding-001"
+            )
+        ),
+        cross_encoder=GeminiRerankerClient(
+            config=LLMConfig(
+                api_key=google_gemini_api_key,
+                model="gemini-2.5-flash-lite"
+            )
+        )
+    )
 
     try:
         # Initialize the graph database with graphiti's indices. This only needs to be done once.
@@ -78,13 +93,13 @@ async def main():
             {
                 'content': 'Kamala Harris is the Attorney General of California. She was previously '
                 'the district attorney for San Francisco.',
-                'type': SourceType.NEWS_ARTICLE,
+                'type': EpisodeType.text,
                 'description': 'News article about Kamala Harris career',
             },
             {
                 'content': 'We are in the hottest year on record. There were many record-breaking temperatures. '
                 'Climate change is a major factor in this.',
-                'type': SourceType.RESEARCH_PAPER,
+                'type': EpisodeType.text,
                 'description': 'Research findings on climate change',
             },
             {
@@ -94,19 +109,19 @@ async def main():
                     'finding': 'Machine learning models can predict climate patterns with 85% accuracy',
                     'publication_date': '2024-01-15',
                 },
-                'type': SourceType.RESEARCH_PAPER,
+                'type': EpisodeType.json,
                 'description': 'Research paper on ML climate prediction',
             },
             {
                 'content': 'Google announced a new quantum computing breakthrough. The quantum computer '
                 'solved a complex problem in minutes that would take classical computers years.',
-                'type': SourceType.NEWS_ARTICLE,
+                'type': EpisodeType.text,
                 'description': 'Tech news about quantum computing',
             },
             {
                 'content': 'OpenAI released GPT-4, which shows significant improvements in reasoning '
                 'and multimodal capabilities compared to previous versions.',
-                'type': SourceType.PODCAST,
+                'type': EpisodeType.text,
                 'description': 'Podcast discussion about AI developments',
             },
         ]
@@ -119,11 +134,11 @@ async def main():
                 episode_body=episode['content']
                 if isinstance(episode['content'], str)
                 else json.dumps(episode['content']),
-                source=episode['type'].value,
+                source=episode['type'],
                 source_description=episode['description'],
                 reference_time=datetime.now(timezone.utc),
             )
-            print(f'Added episode: Episode {i} ({episode["type"].value})')
+            print(f'Added episode: Episode {i} ({episode["type"].name})')
 
         #################################################
         # BASIC SEARCH
