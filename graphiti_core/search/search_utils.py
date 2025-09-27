@@ -194,6 +194,10 @@ async def edge_fulltext_search(
         YIELD node, score
         MATCH (n:Entity)-[:RELATES_TO]->(e:RelatesToNode_ {uuid: node.uuid})-[:RELATES_TO]->(m:Entity)
         """
+    elif driver.provider == GraphProvider.SPANNER:
+        match_query = """
+        MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)
+        """
 
     filter_queries, filter_params = edge_search_filter_query_constructor(
         search_filter, driver.provider
@@ -283,20 +287,35 @@ async def edge_fulltext_search(
         else:
             return []
     else:
-        query = (
-            get_relationships_query('edge_name_and_fact', limit=limit, provider=driver.provider)
-            + match_query
-            + filter_query
-            + """
-            WITH e, score, n, m
-            RETURN
-            """
-            + get_entity_edge_return_query(driver.provider)
-            + """
-            ORDER BY score DESC
-            LIMIT $limit
-            """
-        )
+        if driver.provider == GraphProvider.SPANNER:
+            # For Spanner, construct a simpler query without YIELD/WITH
+            base_query = get_relationships_query('edge_name_and_fact', limit=limit, provider=driver.provider)
+            
+            # Add filter conditions if any  
+            if filter_queries:
+                where_part = ' AND '.join(filter_queries)
+                base_query = base_query.replace('RETURN r', f'AND {where_part} RETURN r')
+            
+            # Replace return clause with proper edge return format
+            query = base_query.replace(
+                'RETURN r LIMIT', 
+                f'RETURN {get_entity_edge_return_query(driver.provider).strip()} LIMIT'
+            ).replace('MATCH ()-[r:', 'MATCH (n:Entity)-[r:').replace(']-() WHERE', ']->(m:Entity) WHERE')
+        else:
+            query = (
+                get_relationships_query('edge_name_and_fact', limit=limit, provider=driver.provider)
+                + match_query
+                + filter_query
+                + """
+                WITH e, score, n, m
+                RETURN
+                """
+                + get_entity_edge_return_query(driver.provider)
+                + """
+                ORDER BY score DESC
+                LIMIT $limit
+                """
+            )
 
         records, _, _ = await driver.execute_query(
             query,
@@ -629,6 +648,8 @@ async def node_fulltext_search(
     yield_query = 'YIELD node AS n, score'
     if driver.provider == GraphProvider.KUZU:
         yield_query = 'WITH node AS n, score'
+    elif driver.provider == GraphProvider.SPANNER:
+        yield_query = ''  # Spanner doesn't support YIELD syntax
 
     if driver.provider == GraphProvider.NEPTUNE:
         res = driver.run_aoss_query('node_name_and_summary', query, limit=limit)  # pyright: ignore reportAttributeAccessIssue
@@ -699,20 +720,38 @@ async def node_fulltext_search(
         else:
             return []
     else:
-        query = (
-            get_nodes_query(
+        if driver.provider == GraphProvider.SPANNER:
+            # For Spanner, construct a simpler query without YIELD/WITH
+            base_query = get_nodes_query(
                 'node_name_and_summary', '$query', limit=limit, provider=driver.provider
             )
-            + yield_query
-            + filter_query
-            + """
-            WITH n, score
-            ORDER BY score DESC
-            LIMIT $limit
-            RETURN
-            """
-            + get_entity_node_return_query(driver.provider)
-        )
+            
+            # Add filter conditions if any
+            if filter_queries:
+                # Insert WHERE conditions into the query
+                where_part = ' AND '.join(filter_queries)
+                # Replace existing WHERE with combined WHERE
+                base_query = base_query.replace('WHERE SEARCH(', f'WHERE SEARCH(')
+                if 'WHERE SEARCH(' in base_query:
+                    # Add additional conditions after SEARCH
+                    base_query = base_query.replace('RETURN n', f'AND {where_part} RETURN n')
+            
+            query = base_query.replace('RETURN n', f'RETURN {get_entity_node_return_query(driver.provider).strip()}')
+        else:
+            query = (
+                get_nodes_query(
+                    'node_name_and_summary', '$query', limit=limit, provider=driver.provider
+                )
+                + yield_query
+                + filter_query
+                + """
+                WITH n, score
+                ORDER BY score DESC
+                LIMIT $limit
+                RETURN
+                """
+                + get_entity_node_return_query(driver.provider)
+            )
 
         records, _, _ = await driver.execute_query(
             query,

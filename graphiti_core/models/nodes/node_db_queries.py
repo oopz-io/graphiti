@@ -287,6 +287,17 @@ def get_entity_node_return_query(provider: GraphProvider) -> str:
             n.attributes AS attributes
         """
 
+    if provider == GraphProvider.SPANNER:
+        return """
+            n.uuid AS uuid,
+            n.name AS name,
+            n.group_id AS group_id,
+            n.created_at AS created_at,
+            n.summary AS summary,
+            LABELS(n) AS labels,
+            '' AS attributes
+        """
+
     return """
         n.uuid AS uuid,
         n.name AS name,
@@ -296,8 +307,6 @@ def get_entity_node_return_query(provider: GraphProvider) -> str:
         labels(n) AS labels,
         properties(n) AS attributes
     """
-
-
 def get_community_node_save_query(provider: GraphProvider) -> str:
     match provider:
         case GraphProvider.FALKORDB:

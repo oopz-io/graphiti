@@ -234,6 +234,8 @@ def get_entity_edge_return_query(provider: GraphProvider) -> str:
     """ + (
         'e.attributes AS attributes'
         if provider == GraphProvider.KUZU
+        else "'' AS attributes"  # For Spanner, return empty string for attributes
+        if provider == GraphProvider.SPANNER
         else 'properties(e) AS attributes'
     )
 

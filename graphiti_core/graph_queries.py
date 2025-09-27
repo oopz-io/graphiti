@@ -53,14 +53,9 @@ def get_range_indices(provider: GraphProvider) -> list[LiteralString]:
         return []
 
     if provider == GraphProvider.SPANNER:
-        # Spanner Graph uses different index syntax
-        # These would be property graph schema definitions rather than indexes
-        return [
-            # Property graph schema creation for Spanner would be done via DDL
-            # This is a placeholder - actual Spanner graph schema would be different
-            'CREATE PROPERTY GRAPH IF NOT EXISTS graphiti_graph',
-            'CREATE OR REPLACE PROPERTY GRAPH graphiti_graph NODE TABLES (Entity, Episodic, Community) EDGE TABLES (RELATES_TO, MENTIONS, HAS_MEMBER)',
-        ]
+        # Spanner Graph setup - property graph creation is handled in build_indices_and_constraints
+        # The actual schema setup is done through the SpannerDriver's DDL execution path
+        return []
 
     return [
         'CREATE INDEX entity_uuid IF NOT EXISTS FOR (n:Entity) ON (n.uuid)',
@@ -163,8 +158,8 @@ def get_nodes_query(name: str, query: str, limit: int, provider: GraphProvider) 
 
     if provider == GraphProvider.SPANNER:
         label = INDEX_TO_LABEL_SPANNER_MAPPING[name]
-        # Spanner GQL uses text search in WHERE clauses
-        return f'MATCH (n:{label}) WHERE SEARCH(n, {query}) RETURN n LIMIT {limit}'
+        # Spanner GQL uses REGEXP_CONTAINS for text matching and @parameter syntax
+        return f'MATCH (n:{label}) WHERE REGEXP_CONTAINS(n.name, @query) OR REGEXP_CONTAINS(COALESCE(n.summary, ""), @query) RETURN n LIMIT {limit}'
 
     return f'CALL db.index.fulltext.queryNodes("{name}", {query}, {{limit: $limit}})'
 
@@ -196,7 +191,7 @@ def get_relationships_query(name: str, limit: int, provider: GraphProvider) -> s
 
     if provider == GraphProvider.SPANNER:
         label = INDEX_TO_LABEL_SPANNER_MAPPING[name]
-        # Spanner GQL relationship search
-        return f'MATCH ()-[r:{label}]-() WHERE SEARCH(r, $query) RETURN r LIMIT {limit}'
+        # Spanner GQL relationship search using REGEXP_CONTAINS and @parameter syntax
+        return f'MATCH ()-[r:{label}]-() WHERE REGEXP_CONTAINS(COALESCE(r.fact, ""), @query) OR REGEXP_CONTAINS(COALESCE(r.name, ""), @query) RETURN r LIMIT {limit}'
 
     return f'CALL db.index.fulltext.queryRelationships("{name}", $query, {{limit: $limit}})'

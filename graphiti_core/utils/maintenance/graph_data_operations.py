@@ -37,6 +37,97 @@ async def build_indices_and_constraints(driver: GraphDriver, delete_existing: bo
     if driver.aoss_client:
         await driver.create_aoss_indices()  # pyright: ignore[reportAttributeAccessIssue]
         return
+        
+    # Special handling for Spanner - create property graph schema
+    if driver.provider == GraphProvider.SPANNER:
+        # Create the property graph schema for Spanner
+        database_name = getattr(driver, '_database', 'graphititest')
+        
+        # First, create the base tables that the property graph will reference
+        table_ddl_statements = [
+            # Entity node table
+            """CREATE TABLE IF NOT EXISTS Entity (
+                uuid STRING(MAX) NOT NULL,
+                name STRING(MAX),
+                group_id STRING(MAX),
+                labels ARRAY<STRING(MAX)>,
+                created_at TIMESTAMP,
+                name_embedding ARRAY<FLOAT64>,
+                summary STRING(MAX),
+                attributes JSON
+            ) PRIMARY KEY (uuid)""",
+            
+            # Episodic node table
+            """CREATE TABLE IF NOT EXISTS Episodic (
+                uuid STRING(MAX) NOT NULL,
+                name STRING(MAX),
+                group_id STRING(MAX),
+                created_at TIMESTAMP,
+                source STRING(MAX),
+                source_description STRING(MAX),
+                content STRING(MAX),
+                valid_at TIMESTAMP,
+                entity_edges ARRAY<STRING(MAX)>
+            ) PRIMARY KEY (uuid)""",
+            
+            # Community node table
+            """CREATE TABLE IF NOT EXISTS Community (
+                uuid STRING(MAX) NOT NULL,
+                name STRING(MAX),
+                group_id STRING(MAX),
+                created_at TIMESTAMP,
+                name_embedding ARRAY<FLOAT64>,
+                summary STRING(MAX)
+            ) PRIMARY KEY (uuid)""",
+            
+            # RELATES_TO edge table
+            """CREATE TABLE IF NOT EXISTS RELATES_TO (
+                uuid STRING(MAX) NOT NULL,
+                source_uuid STRING(MAX) NOT NULL,
+                target_uuid STRING(MAX) NOT NULL,
+                group_id STRING(MAX),
+                created_at TIMESTAMP,
+                name STRING(MAX),
+                fact STRING(MAX),
+                fact_embedding ARRAY<FLOAT64>,
+                episodes ARRAY<STRING(MAX)>,
+                expired_at TIMESTAMP,
+                valid_at TIMESTAMP,
+                invalid_at TIMESTAMP,
+                attributes JSON
+            ) PRIMARY KEY (uuid)"""
+        ]
+        
+        # Create base tables first
+        for ddl_statement in table_ddl_statements:
+            try:
+                await driver.execute_query(ddl_statement)
+                logger.info(f"Created or verified table")
+            except Exception as e:
+                logger.warning(f"Table creation skipped or failed: {e}")
+                # Continue - table might already exist
+        
+        # Then create the property graph schema
+        property_graph_ddl = f"""CREATE OR REPLACE PROPERTY GRAPH `{database_name}`
+        NODE TABLES (
+            Entity,
+            Episodic,
+            Community
+        )
+        EDGE TABLES (
+            RELATES_TO
+                SOURCE KEY(source_uuid) REFERENCES Entity(uuid)
+                DESTINATION KEY(target_uuid) REFERENCES Entity(uuid)
+        )"""
+        
+        try:
+            await driver.execute_query(property_graph_ddl)
+            logger.info(f"Created property graph schema for database: {database_name}")
+        except Exception as e:
+            logger.warning(f"Property graph creation skipped or failed: {e}")
+            # Continue with other setup - the graph might already exist
+        return
+    
     if delete_existing:
         records, _, _ = await driver.execute_query(
             """

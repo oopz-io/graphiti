@@ -1,8 +1,25 @@
 """
-Copyright 2024, Zep Software, Inc.
+Copyright 2                elif isinstance(param_value, str):
+                    # Escape problematic characters for GQL
+                    escaped_value = param_value.replace('\\', '\\\\')
+                    gql_query = gql_query.replace(at_placeholder, f"'{escaped_value}'") Zep Software, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
+you may not use this file except in comp        # Handle parameter substitution - convert $param to @param for Spanner
+        for param_name, param_value in params.items():
+            dollar_placeholder = f'${param_name}'
+            at_placeholder = f'@{param_name}'
+            
+            # Convert $param to @param first
+            if dollar_placeholder in gql_query:
+                gql_query = gql_query.replace(dollar_placeholder, at_placeholder)
+            
+            # Then substitute the actual values
+            if at_placeholder in gql_query:
+                if isinstance(param_value, str):
+                    # Escape problematic characters for GQL
+                    escaped_value = param_value.replace('\\', '\\\\')
+                    gql_query = gql_query.replace(at_placeholder, f"'{escaped_value}'")ith the License.
 You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
@@ -51,24 +68,63 @@ class SpannerDriverSession(GraphDriverSession):
         Execute a GQL query using the Spanner session.
         Converts Cypher-like queries to GQL format.
         """
-        # Convert Cypher to GQL
-        gql_query = self._convert_cypher_to_gql(query, **kwargs)
+        # Convert Cypher to GQL - separate params from other kwargs
+        # Filter out complex objects that Spanner can't handle as parameters
+        params = {}
+        for key, value in kwargs.items():
+            if isinstance(value, (str, int, float, bool, type(None))) or hasattr(value, 'isoformat'):
+                params[key] = value
+            elif isinstance(value, (list, tuple)) and all(isinstance(x, (str, int, float, bool)) for x in value):
+                params[key] = value
+            # Skip complex objects like dicts, custom objects, etc.
+        
+        gql_query = self._convert_cypher_to_gql(query, params)
 
-        def execute_query():
+        # Handle different types of operations
+        if self._is_ddl_operation(query):
+            # DDL operations need to use database admin API
+            return await self._execute_ddl(gql_query)
+        elif self._is_write_operation(query):
+            # DML write operations - use snapshot for now since we're not in a transaction context
             with self._session.database.snapshot() as snapshot:
-                return snapshot.execute_sql(gql_query)
-
-        # For write operations, use a transaction
-        if self._is_write_operation(query):
-
-            def execute_write(transaction):
-                return transaction.execute_sql(gql_query)
-
-            result = self._session.database.run_in_transaction(execute_write)
+                result = snapshot.execute_sql(gql_query, params=params)
         else:
-            result = execute_query()
+            # Read operations use snapshots
+            with self._session.database.snapshot() as snapshot:
+                result = snapshot.execute_sql(gql_query, params=params)
 
         return self._format_result(result)
+
+    async def _execute_ddl(self, ddl_statement: str) -> Any:
+        """Execute DDL statement using database admin API"""
+        try:
+            from google.cloud.spanner_admin_database_v1.types import spanner_database_admin
+            
+            # Get database admin client
+            spanner_client = self._session.database._instance._client
+            database_admin_api = spanner_client.database_admin_api
+
+            # Execute DDL update
+            request = spanner_database_admin.UpdateDatabaseDdlRequest(
+                database=database_admin_api.database_path(
+                    spanner_client.project, 
+                    self._session.database._instance._instance_id,
+                    self._session.database._database_id
+                ),
+                statements=[ddl_statement],
+            )
+
+            operation = database_admin_api.update_database_ddl(request)
+            
+            # Wait for operation to complete (with timeout)
+            operation.result(timeout=300)  # 5 minute timeout
+            
+            logger.info(f"DDL operation completed: {ddl_statement}")
+            return {'success': True, 'statement': ddl_statement}
+            
+        except Exception as e:
+            logger.error(f"Error executing DDL statement: {e}\nStatement: {ddl_statement}")
+            raise
 
     async def close(self):
         """Close the session - handled automatically by Spanner client"""
@@ -76,9 +132,17 @@ class SpannerDriverSession(GraphDriverSession):
 
     async def execute_write(self, func, *args, **kwargs):
         """Execute a write transaction"""
-        return self._session.database.run_in_transaction(func, *args, **kwargs)
+        # For Spanner, we'll manage the transaction manually since run_in_transaction
+        # expects synchronous functions but Graphiti uses async patterns
+        try:
+            # Begin transaction manually if needed
+            # For now, just execute the function directly like FalkorDB does
+            return await func(self, *args, **kwargs)
+        except Exception as e:
+            logger.error(f"Error in execute_write: {e}")
+            raise
 
-    def _convert_cypher_to_gql(self, cypher_query: str, **kwargs) -> str:
+    def _convert_cypher_to_gql(self, cypher_query: str, params: dict) -> str:
         """
         Convert Cypher queries to Google Cloud Spanner GQL format.
         This is a simplified conversion - in production, you'd want a more robust parser.
@@ -86,9 +150,16 @@ class SpannerDriverSession(GraphDriverSession):
         # Basic GQL conversion patterns
         gql_query = cypher_query
 
-        # Add GRAPH clause at the beginning if not present
+        # Add GRAPH clause if not present (required for Spanner Graph queries)
         if not gql_query.strip().upper().startswith('GRAPH'):
-            gql_query = f'GRAPH {self._database_name}\n{gql_query}'
+            gql_query = f'GRAPH `{self._database_name}` {gql_query}'
+
+        # Add GRAPH clause at the beginning if not present and not a DDL operation
+        if (not gql_query.strip().upper().startswith('GRAPH') and 
+            not self._is_ddl_operation(gql_query)):
+            # Use backticks for database names that might contain special characters
+            database_name = f'`{self._database_name}`' if '-' in self._database_name else self._database_name
+            gql_query = f'GRAPH {database_name}\n{gql_query}'
 
         # Convert MATCH patterns
         # Cypher: MATCH (n:Label {prop: value})
@@ -102,26 +173,76 @@ class SpannerDriverSession(GraphDriverSession):
             logger.warning('MERGE converted to MATCH - may need manual adjustment for upsert logic')
 
         # Handle parameter substitution
-        for param_name, param_value in kwargs.get('params', {}).items():
-            if isinstance(param_value, str):
-                gql_query = gql_query.replace(f'${param_name}', f"'{param_value}'")
-            else:
-                gql_query = gql_query.replace(f'${param_name}', str(param_value))
+        for param_name, param_value in params.items():
+            placeholder = f'${param_name}'
+            if placeholder in gql_query:
+                if isinstance(param_value, str):
+                    # Escape problematic characters for GQL
+                    escaped_value = param_value.replace('\\', '\\\\')  # Escape backslashes
+                    gql_query = gql_query.replace(placeholder, f"'{escaped_value}'")
+                elif param_value is None:
+                    gql_query = gql_query.replace(placeholder, 'NULL')
+                elif hasattr(param_value, 'isoformat'):  # datetime-like objects
+                    # Format datetime as a properly quoted timestamp literal
+                    gql_query = gql_query.replace(placeholder, f"TIMESTAMP '{param_value.isoformat()}'")
+                elif isinstance(param_value, (list, tuple)):
+                    # Convert list/array to GQL IN clause format: ('value1', 'value2', ...)
+                    if all(isinstance(item, str) for item in param_value):
+                        values = "', '".join(param_value)
+                        gql_query = gql_query.replace(placeholder, f"('{values}')")
+                    else:
+                        values = ', '.join(str(item) for item in param_value)
+                        gql_query = gql_query.replace(placeholder, f"({values})")
+                else:
+                    gql_query = gql_query.replace(placeholder, str(param_value))
 
         return gql_query
 
+    def _is_ddl_operation(self, query: str) -> bool:
+        """Check if the query is a DDL (Data Definition Language) operation"""
+        ddl_keywords = ['CREATE', 'ALTER', 'DROP', 'CREATE PROPERTY GRAPH', 'CREATE OR REPLACE PROPERTY GRAPH']
+        query_upper = query.upper().strip()
+        return any(query_upper.startswith(keyword) for keyword in ddl_keywords)
+
     def _is_write_operation(self, query: str) -> bool:
-        """Check if the query is a write operation"""
-        write_keywords = ['CREATE', 'MERGE', 'SET', 'DELETE', 'REMOVE', 'DROP']
+        """Check if the query is a write operation (DML)"""
+        write_keywords = ['INSERT', 'UPDATE', 'DELETE', 'MERGE', 'SET', 'REMOVE']
         query_upper = query.upper()
         return any(keyword in query_upper for keyword in write_keywords)
 
     def _format_result(self, result) -> Any:
-        """Format Spanner result to match expected format"""
-        # Convert Spanner result to a format compatible with other drivers
-        if hasattr(result, 'rows'):
-            return result
-        return result
+        """Format Spanner result to match expected interface"""
+        # Convert Spanner results to a format compatible with other graph drivers
+        # Expected format is (records, header, summary) where records is a list of dicts
+        
+        if result is None:
+            return [], None, None
+            
+        try:
+            # Convert Spanner ResultSet to list of dictionaries
+            records = []
+            if hasattr(result, '__iter__'):
+                for row in result:
+                    # Convert each row to a dictionary
+                    # Spanner rows are typically dictionary-like already
+                    if hasattr(row, '_asdict'):
+                        records.append(row._asdict())
+                    elif isinstance(row, dict):
+                        records.append(row)
+                    else:
+                        # Try to convert row to dict if it has field names
+                        try:
+                            records.append(dict(row))
+                        except:
+                            # If conversion fails, create a generic record
+                            records.append({'result': row})
+            
+            return records, None, None
+            
+        except Exception as e:
+            logger.warning(f"Error formatting Spanner result: {e}")
+            # Return empty results if formatting fails
+            return [], None, None
 
 
 class SpannerDriver(GraphDriver):
@@ -153,23 +274,26 @@ class SpannerDriver(GraphDriver):
 
     async def execute_query(self, cypher_query_: LiteralString, **kwargs: Any) -> Any:
         """Execute a query against Spanner Graph database"""
-        params = kwargs.pop('params', None)
-        if params is None:
-            params = {}
+        # Collect all parameters
+        params = kwargs.copy()
         params.setdefault('database_', self._database)
 
         try:
             # Convert Cypher to GQL
             gql_query = self._convert_cypher_to_gql(str(cypher_query_), params)
 
-            # Execute based on query type
-            if self._is_write_operation(str(cypher_query_)):
-
+            # Handle different types of operations
+            if self._is_ddl_operation(str(cypher_query_)):
+                # DDL operations need to use database admin API
+                return await self._execute_ddl_direct(gql_query)
+            elif self._is_write_operation(str(cypher_query_)):
+                # DML write operations use transactions
                 def execute_write(transaction):
                     return transaction.execute_sql(gql_query)
 
                 result = self.spanner_database.run_in_transaction(execute_write)
             else:
+                # Read operations use snapshots
                 with self.spanner_database.snapshot() as snapshot:
                     result = snapshot.execute_sql(gql_query)
 
@@ -180,6 +304,33 @@ class SpannerDriver(GraphDriver):
             raise
 
         return self._format_result(result)
+
+    async def _execute_ddl_direct(self, ddl_statement: str) -> Any:
+        """Execute DDL statement using database admin API (direct method)"""
+        try:
+            from google.cloud.spanner_admin_database_v1.types import spanner_database_admin
+            
+            # Execute DDL update
+            request = spanner_database_admin.UpdateDatabaseDdlRequest(
+                database=self.spanner_client.database_admin_api.database_path(
+                    self.spanner_client.project,
+                    self.spanner_instance_id,
+                    self.spanner_database_id
+                ),
+                statements=[ddl_statement],
+            )
+
+            operation = self.spanner_client.database_admin_api.update_database_ddl(request)
+            
+            # Wait for operation to complete (with timeout)
+            operation.result(timeout=300)  # 5 minute timeout
+            
+            logger.info(f"DDL operation completed: {ddl_statement}")
+            return {'success': True, 'statement': ddl_statement}
+            
+        except Exception as e:
+            logger.error(f"Error executing DDL statement: {e}\nStatement: {ddl_statement}")
+            raise
 
     def session(self, database: str | None = None) -> GraphDriverSession:
         """Create a new database session"""
@@ -309,7 +460,7 @@ class SpannerDriver(GraphDriver):
 
         # Build complete query
         query = f"""
-        GRAPH {self._database}
+        GRAPH `{self._database}`
         MATCH (n)
         {where_clause}
         RETURN n, {similarity_expr} AS similarity_score
@@ -386,7 +537,7 @@ class SpannerDriver(GraphDriver):
         # Build complete hybrid query
         # Note: This assumes nodes have both 'content' text field and 'embedding' vector field
         query = f"""
-        GRAPH {self._database}
+        GRAPH `{self._database}`
         MATCH (n)
         {where_clause}
         RETURN n,
@@ -408,9 +559,11 @@ class SpannerDriver(GraphDriver):
         """
         gql_query = cypher_query
 
-        # Add GRAPH clause if not present
-        if not gql_query.strip().upper().startswith('GRAPH'):
-            gql_query = f'GRAPH {self._database}\n{gql_query}'
+        # Add GRAPH clause if not present and not a DDL operation
+        if (not gql_query.strip().upper().startswith('GRAPH') and 
+            not self._is_ddl_operation(gql_query)):
+            # Wrap database name in backticks to handle special characters like hyphens
+            gql_query = f'GRAPH `{self._database}`\n{gql_query}'
 
         # Convert MERGE operations to MATCH + conditional CREATE
         # This is a simplified approach - real implementation needs proper upsert logic
@@ -418,27 +571,81 @@ class SpannerDriver(GraphDriver):
             gql_query = gql_query.replace('MERGE', 'MATCH')
             logger.warning('MERGE converted to MATCH - may need manual upsert logic')
 
-        # Handle parameter substitution
+        # Handle parameter substitution - convert $param to @param for Spanner
         for param_name, param_value in params.items():
-            placeholder = f'${param_name}'
-            if placeholder in gql_query:
+            dollar_placeholder = f'${param_name}'
+            at_placeholder = f'@{param_name}'
+            
+            # Convert $param to @param first
+            if dollar_placeholder in gql_query:
+                gql_query = gql_query.replace(dollar_placeholder, at_placeholder)
+            
+            # Then substitute the actual values
+            if at_placeholder in gql_query:
                 if isinstance(param_value, str):
-                    gql_query = gql_query.replace(placeholder, f"'{param_value}'")
+                    # Escape problematic characters for GQL
+                    escaped_value = param_value.replace('\\', '\\\\')  # Escape backslashes
+                    gql_query = gql_query.replace(at_placeholder, f"'{escaped_value}'")
                 elif param_value is None:
-                    gql_query = gql_query.replace(placeholder, 'NULL')
+                    gql_query = gql_query.replace(at_placeholder, 'NULL')
+                elif hasattr(param_value, 'isoformat'):  # datetime-like objects
+                    # Format datetime as a properly quoted timestamp literal
+                    gql_query = gql_query.replace(at_placeholder, f"TIMESTAMP '{param_value.isoformat()}'")
+                elif isinstance(param_value, (list, tuple)):
+                    # Convert list/array to GQL IN clause format: ('value1', 'value2', ...)
+                    if all(isinstance(item, str) for item in param_value):
+                        values = "', '".join(param_value)
+                        gql_query = gql_query.replace(at_placeholder, f"('{values}')")
+                    else:
+                        values = ', '.join(str(item) for item in param_value)
+                        gql_query = gql_query.replace(at_placeholder, f"({values})")
                 else:
-                    gql_query = gql_query.replace(placeholder, str(param_value))
+                    gql_query = gql_query.replace(at_placeholder, str(param_value))
 
         return gql_query
 
+    def _is_ddl_operation(self, query: str) -> bool:
+        """Check if the query is a DDL (Data Definition Language) operation"""
+        ddl_keywords = ['CREATE', 'ALTER', 'DROP', 'CREATE PROPERTY GRAPH', 'CREATE OR REPLACE PROPERTY GRAPH']
+        query_upper = query.upper().strip()
+        return any(query_upper.startswith(keyword) for keyword in ddl_keywords)
+
     def _is_write_operation(self, query: str) -> bool:
         """Check if the query performs write operations"""
-        write_patterns = ['CREATE', 'MERGE', 'SET', 'DELETE', 'REMOVE', 'DROP', 'INSERT', 'UPDATE']
+        write_patterns = ['INSERT', 'UPDATE', 'DELETE', 'MERGE', 'SET', 'REMOVE']
         query_upper = query.upper()
         return any(pattern in query_upper for pattern in write_patterns)
 
     def _format_result(self, result) -> Any:
         """Format Spanner result to match expected interface"""
         # Convert Spanner results to a format compatible with other graph drivers
-        # This may need adjustment based on the actual result format from Spanner
-        return result
+        # Expected format is (records, header, summary) where records is a list of dicts
+        
+        if result is None:
+            return [], None, None
+            
+        try:
+            # Convert Spanner ResultSet to list of dictionaries
+            records = []
+            if hasattr(result, '__iter__'):
+                for row in result:
+                    # Convert each row to a dictionary
+                    # Spanner rows are typically dictionary-like already
+                    if hasattr(row, '_asdict'):
+                        records.append(row._asdict())
+                    elif isinstance(row, dict):
+                        records.append(row)
+                    else:
+                        # Try to convert row to dict if it has field names
+                        try:
+                            records.append(dict(row))
+                        except:
+                            # If conversion fails, create a generic record
+                            records.append({'result': row})
+            
+            return records, None, None
+            
+        except Exception as e:
+            logger.warning(f"Error formatting Spanner result: {e}")
+            # Return empty results if formatting fails
+            return [], None, None
