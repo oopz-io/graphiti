@@ -1,35 +1,3 @@
-"""
-Copyright 2                elif isinstance(param_value, str):
-                    # Escape problematic characters for GQL
-                    escaped_value = param_value.replace('\\', '\\\\')
-                    gql_query = gql_query.replace(at_placeholder, f"'{escaped_value}'") Zep Software, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in comp        # Handle parameter substitution - convert $param to @param for Spanner
-        for param_name, param_value in params.items():
-            dollar_placeholder = f'${param_name}'
-            at_placeholder = f'@{param_name}'
-            
-            # Convert $param to @param first
-            if dollar_placeholder in gql_query:
-                gql_query = gql_query.replace(dollar_placeholder, at_placeholder)
-            
-            # Then substitute the actual values
-            if at_placeholder in gql_query:
-                if isinstance(param_value, str):
-                    # Escape problematic characters for GQL
-                    escaped_value = param_value.replace('\\', '\\\\')
-                    gql_query = gql_query.replace(at_placeholder, f"'{escaped_value}'")ith the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
 
 import logging
 from collections.abc import Coroutine
@@ -144,58 +112,54 @@ class SpannerDriverSession(GraphDriverSession):
 
     def _convert_cypher_to_gql(self, cypher_query: str, params: dict) -> str:
         """
-        Convert Cypher queries to Google Cloud Spanner GQL format.
-        This is a simplified conversion - in production, you'd want a more robust parser.
+        Convert Cypher queries to Google Cloud Spanner GQL format using the dedicated parser.
         """
-        # Basic GQL conversion patterns
+        from graphiti_core.utils.cypher_to_gql_parser import convert_cypher_to_gql
+        
+        try:
+            converted_query, warnings = convert_cypher_to_gql(
+                cypher_query, 
+                self._database_name, 
+                params
+            )
+            
+            # Log any conversion warnings
+            for warning in warnings:
+                logger.warning(f'Cypher-to-GQL conversion: {warning}')
+            
+            return converted_query
+            
+        except Exception as e:
+            logger.error(f'Error in Cypher-to-GQL conversion: {e}')
+            logger.info('Falling back to basic conversion')
+            
+            # Fallback to basic conversion if the parser fails
+            return self._basic_cypher_to_gql_fallback(cypher_query, params)
+    
+    def _basic_cypher_to_gql_fallback(self, cypher_query: str, params: dict) -> str:
+        """
+        Basic fallback conversion for when the main parser fails.
+        """
         gql_query = cypher_query
-
-        # Add GRAPH clause if not present (required for Spanner Graph queries)
-        if not gql_query.strip().upper().startswith('GRAPH'):
-            gql_query = f'GRAPH `{self._database_name}` {gql_query}'
-
-        # Add GRAPH clause at the beginning if not present and not a DDL operation
+        
+        # Add GRAPH clause if needed
         if (not gql_query.strip().upper().startswith('GRAPH') and 
             not self._is_ddl_operation(gql_query)):
-            # Use backticks for database names that might contain special characters
             database_name = f'`{self._database_name}`' if '-' in self._database_name else self._database_name
             gql_query = f'GRAPH {database_name}\n{gql_query}'
-
-        # Convert MATCH patterns
-        # Cypher: MATCH (n:Label {prop: value})
-        # GQL: MATCH (n:Label {prop: value})
-        # GQL is quite similar to Cypher for basic patterns
-
-        # Convert MERGE to CREATE/MATCH pattern
-        if 'MERGE' in gql_query.upper():
-            # This is a simplified conversion - real implementation would need proper parsing
-            gql_query = gql_query.replace('MERGE', 'MATCH')
-            logger.warning('MERGE converted to MATCH - may need manual adjustment for upsert logic')
-
-        # Handle parameter substitution
+        
+        # Basic parameter substitution
         for param_name, param_value in params.items():
             placeholder = f'${param_name}'
             if placeholder in gql_query:
                 if isinstance(param_value, str):
-                    # Escape problematic characters for GQL
-                    escaped_value = param_value.replace('\\', '\\\\')  # Escape backslashes
+                    escaped_value = param_value.replace('\\', '\\\\').replace("'", "\\'")
                     gql_query = gql_query.replace(placeholder, f"'{escaped_value}'")
                 elif param_value is None:
                     gql_query = gql_query.replace(placeholder, 'NULL')
-                elif hasattr(param_value, 'isoformat'):  # datetime-like objects
-                    # Format datetime as a properly quoted timestamp literal
-                    gql_query = gql_query.replace(placeholder, f"TIMESTAMP '{param_value.isoformat()}'")
-                elif isinstance(param_value, (list, tuple)):
-                    # Convert list/array to GQL IN clause format: ('value1', 'value2', ...)
-                    if all(isinstance(item, str) for item in param_value):
-                        values = "', '".join(param_value)
-                        gql_query = gql_query.replace(placeholder, f"('{values}')")
-                    else:
-                        values = ', '.join(str(item) for item in param_value)
-                        gql_query = gql_query.replace(placeholder, f"({values})")
                 else:
                     gql_query = gql_query.replace(placeholder, str(param_value))
-
+        
         return gql_query
 
     def _is_ddl_operation(self, query: str) -> bool:
@@ -554,54 +518,53 @@ class SpannerDriver(GraphDriver):
 
     def _convert_cypher_to_gql(self, cypher_query: str, params: dict) -> str:
         """
-        Convert Cypher queries to Google Cloud Spanner GQL format.
-        This is a basic conversion - production use would need a more sophisticated parser.
+        Convert Cypher queries to Google Cloud Spanner GQL format using the dedicated parser.
+        """
+        from graphiti_core.utils.cypher_to_gql_parser import convert_cypher_to_gql
+        
+        try:
+            converted_query, warnings = convert_cypher_to_gql(
+                cypher_query, 
+                self._database, 
+                params
+            )
+            
+            # Log any conversion warnings
+            for warning in warnings:
+                logger.warning(f'Cypher-to-GQL conversion: {warning}')
+            
+            return converted_query
+            
+        except Exception as e:
+            logger.error(f'Error in Cypher-to-GQL conversion: {e}')
+            logger.info('Falling back to basic conversion')
+            
+            # Fallback to basic conversion if the parser fails
+            return self._basic_cypher_to_gql_fallback(cypher_query, params)
+    
+    def _basic_cypher_to_gql_fallback(self, cypher_query: str, params: dict) -> str:
+        """
+        Basic fallback conversion for when the main parser fails.
         """
         gql_query = cypher_query
-
-        # Add GRAPH clause if not present and not a DDL operation
+        
+        # Add GRAPH clause if needed
         if (not gql_query.strip().upper().startswith('GRAPH') and 
             not self._is_ddl_operation(gql_query)):
-            # Wrap database name in backticks to handle special characters like hyphens
             gql_query = f'GRAPH `{self._database}`\n{gql_query}'
-
-        # Convert MERGE operations to MATCH + conditional CREATE
-        # This is a simplified approach - real implementation needs proper upsert logic
-        if 'MERGE' in gql_query.upper():
-            gql_query = gql_query.replace('MERGE', 'MATCH')
-            logger.warning('MERGE converted to MATCH - may need manual upsert logic')
-
-        # Handle parameter substitution - convert $param to @param for Spanner
+        
+        # Basic parameter substitution
         for param_name, param_value in params.items():
-            dollar_placeholder = f'${param_name}'
-            at_placeholder = f'@{param_name}'
-            
-            # Convert $param to @param first
-            if dollar_placeholder in gql_query:
-                gql_query = gql_query.replace(dollar_placeholder, at_placeholder)
-            
-            # Then substitute the actual values
-            if at_placeholder in gql_query:
+            placeholder = f'${param_name}'
+            if placeholder in gql_query:
                 if isinstance(param_value, str):
-                    # Escape problematic characters for GQL
-                    escaped_value = param_value.replace('\\', '\\\\')  # Escape backslashes
-                    gql_query = gql_query.replace(at_placeholder, f"'{escaped_value}'")
+                    escaped_value = param_value.replace('\\', '\\\\').replace("'", "\\'")
+                    gql_query = gql_query.replace(placeholder, f"'{escaped_value}'")
                 elif param_value is None:
-                    gql_query = gql_query.replace(at_placeholder, 'NULL')
-                elif hasattr(param_value, 'isoformat'):  # datetime-like objects
-                    # Format datetime as a properly quoted timestamp literal
-                    gql_query = gql_query.replace(at_placeholder, f"TIMESTAMP '{param_value.isoformat()}'")
-                elif isinstance(param_value, (list, tuple)):
-                    # Convert list/array to GQL IN clause format: ('value1', 'value2', ...)
-                    if all(isinstance(item, str) for item in param_value):
-                        values = "', '".join(param_value)
-                        gql_query = gql_query.replace(at_placeholder, f"('{values}')")
-                    else:
-                        values = ', '.join(str(item) for item in param_value)
-                        gql_query = gql_query.replace(at_placeholder, f"({values})")
+                    gql_query = gql_query.replace(placeholder, 'NULL')
                 else:
-                    gql_query = gql_query.replace(at_placeholder, str(param_value))
-
+                    gql_query = gql_query.replace(placeholder, str(param_value))
+        
         return gql_query
 
     def _is_ddl_operation(self, query: str) -> bool:

@@ -158,8 +158,9 @@ def get_nodes_query(name: str, query: str, limit: int, provider: GraphProvider) 
 
     if provider == GraphProvider.SPANNER:
         label = INDEX_TO_LABEL_SPANNER_MAPPING[name]
-        # Spanner GQL uses REGEXP_CONTAINS for text matching and @parameter syntax
-        return f'MATCH (n:{label}) WHERE REGEXP_CONTAINS(n.name, @query) OR REGEXP_CONTAINS(COALESCE(n.summary, ""), @query) RETURN n LIMIT {limit}'
+        # Use LIKE for simpler text matching, converting search terms to LIKE patterns
+        # This avoids complex regex escaping issues
+        return f'MATCH (n:{label}) WHERE COALESCE(n.name, "") LIKE CONCAT("%", @query, "%") OR COALESCE(n.summary, "") LIKE CONCAT("%", @query, "%") RETURN n LIMIT {limit}'
 
     return f'CALL db.index.fulltext.queryNodes("{name}", {query}, {{limit: $limit}})'
 
@@ -191,7 +192,7 @@ def get_relationships_query(name: str, limit: int, provider: GraphProvider) -> s
 
     if provider == GraphProvider.SPANNER:
         label = INDEX_TO_LABEL_SPANNER_MAPPING[name]
-        # Spanner GQL relationship search using REGEXP_CONTAINS and @parameter syntax
-        return f'MATCH ()-[r:{label}]-() WHERE REGEXP_CONTAINS(COALESCE(r.fact, ""), @query) OR REGEXP_CONTAINS(COALESCE(r.name, ""), @query) RETURN r LIMIT {limit}'
+        # Use LIKE for simpler text matching in relationships
+        return f'MATCH ()-[r:{label}]-() WHERE COALESCE(r.fact, "") LIKE CONCAT("%", @query, "%") OR COALESCE(r.name, "") LIKE CONCAT("%", @query, "%") RETURN r LIMIT {limit}'
 
     return f'CALL db.index.fulltext.queryRelationships("{name}", $query, {{limit: $limit}})'

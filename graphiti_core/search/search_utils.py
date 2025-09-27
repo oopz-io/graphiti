@@ -284,23 +284,45 @@ async def edge_fulltext_search(
             entity_edges = await EntityEdge.get_by_uuids(driver, list(input_uuids.keys()))
             entity_edges.sort(key=lambda e: input_uuids.get(e.uuid, 0), reverse=True)
             return entity_edges
-        else:
-            return []
+        return []
     else:
         if driver.provider == GraphProvider.SPANNER:
-            # For Spanner, construct a simpler query without YIELD/WITH
-            base_query = get_relationships_query('edge_name_and_fact', limit=limit, provider=driver.provider)
+            # For Spanner, build a complete GQL query without YIELD/WITH/score patterns
+            # Use custom return fields that match our variable names (r instead of e)
+            spanner_edge_return_fields = """
+            r.uuid AS uuid,
+            n.uuid AS source_node_uuid,
+            m.uuid AS target_node_uuid,
+            r.group_id AS group_id,
+            r.created_at AS created_at,
+            r.name AS name,
+            r.fact AS fact,
+            r.episodes AS episodes,
+            r.expired_at AS expired_at,
+            r.valid_at AS valid_at,
+            r.invalid_at AS invalid_at,
+            '' AS attributes
+            """.strip()
             
-            # Add filter conditions if any  
+            # Build complete WHERE conditions list
+            where_conditions = []
+            
+            # Add search conditions using LIKE pattern matching
+            where_conditions.append("(COALESCE(r.fact, '') LIKE CONCAT('%', @query, '%') OR COALESCE(r.name, '') LIKE CONCAT('%', @query, '%'))")
+            
+            # Add filter conditions (convert e. to r. for consistency)
             if filter_queries:
-                where_part = ' AND '.join(filter_queries)
-                base_query = base_query.replace('RETURN r', f'AND {where_part} RETURN r')
+                spanner_filter_queries = [fq.replace('e.', 'r.') for fq in filter_queries]
+                where_conditions.extend(spanner_filter_queries)
             
-            # Replace return clause with proper edge return format
-            query = base_query.replace(
-                'RETURN r LIMIT', 
-                f'RETURN {get_entity_edge_return_query(driver.provider).strip()} LIMIT'
-            ).replace('MATCH ()-[r:', 'MATCH (n:Entity)-[r:').replace(']-() WHERE', ']->(m:Entity) WHERE')
+            # Build complete query - note the explicit node binding for Spanner
+            query = f"""
+            MATCH (n:Entity)-[r:RELATES_TO]->(m:Entity)
+            WHERE {' AND '.join(where_conditions)}
+            RETURN {spanner_edge_return_fields}
+            ORDER BY r.name
+            LIMIT {limit}
+            """
         else:
             query = (
                 get_relationships_query('edge_name_and_fact', limit=limit, provider=driver.provider)
@@ -467,22 +489,61 @@ async def edge_similarity_search(
         return []
 
     else:
-        query = (
-            match_query
-            + filter_query
-            + """
-            WITH DISTINCT e, n, m, """
-            + get_vector_cosine_func_query('e.fact_embedding', search_vector_var, driver.provider)
-            + """ AS score
-            WHERE score > $min_score
-            RETURN
+        if driver.provider == GraphProvider.SPANNER:
+            # For Spanner, build a complete GQL query without vector similarity (not supported)
+            # Use custom return fields that match our variable names (e instead of r, keeping n, m)
+            spanner_edge_return_fields = """
+            e.uuid AS uuid,
+            n.uuid AS source_node_uuid,
+            m.uuid AS target_node_uuid,
+            e.group_id AS group_id,
+            e.created_at AS created_at,
+            e.name AS name,
+            e.fact AS fact,
+            e.episodes AS episodes,
+            e.expired_at AS expired_at,
+            e.valid_at AS valid_at,
+            e.invalid_at AS invalid_at,
+            '' AS attributes
+            """.strip()
+            
+            # Build complete WHERE conditions list
+            where_conditions = []
+            
+            # Add filter conditions
+            if filter_queries:
+                where_conditions.extend(filter_queries)
+            
+            # Build complete query - simplified without vector similarity
+            if where_conditions:
+                where_clause = f"WHERE {' AND '.join(where_conditions)}"
+            else:
+                where_clause = ""
+                
+            query = f"""
+            MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)
+            {where_clause}
+            RETURN {spanner_edge_return_fields}
+            ORDER BY e.name
+            LIMIT {limit}
             """
-            + get_entity_edge_return_query(driver.provider)
-            + """
-            ORDER BY score DESC
-            LIMIT $limit
-            """
-        )
+        else:
+            query = (
+                match_query
+                + filter_query
+                + """
+                WITH DISTINCT e, n, m, """
+                + get_vector_cosine_func_query('e.fact_embedding', search_vector_var, driver.provider)
+                + """ AS score
+                WHERE score > $min_score
+                RETURN
+                """
+                + get_entity_edge_return_query(driver.provider)
+                + """
+                ORDER BY score DESC
+                LIMIT $limit
+                """
+            )
 
         records, _, _ = await driver.execute_query(
             query,
@@ -721,22 +782,27 @@ async def node_fulltext_search(
             return []
     else:
         if driver.provider == GraphProvider.SPANNER:
-            # For Spanner, construct a simpler query without YIELD/WITH
-            base_query = get_nodes_query(
-                'node_name_and_summary', '$query', limit=limit, provider=driver.provider
-            )
+            # For Spanner, build a complete GQL query that doesn't use YIELD/WITH patterns
+            node_return_fields = get_entity_node_return_query(driver.provider).strip()
             
-            # Add filter conditions if any
+            # Build complete WHERE conditions list
+            where_conditions = []
+            
+            # Add search conditions using LIKE pattern matching (simpler than fulltext)
+            where_conditions.append("(COALESCE(n.name, '') LIKE CONCAT('%', @query, '%') OR COALESCE(n.summary, '') LIKE CONCAT('%', @query, '%'))")
+            
+            # Add filter conditions
             if filter_queries:
-                # Insert WHERE conditions into the query
-                where_part = ' AND '.join(filter_queries)
-                # Replace existing WHERE with combined WHERE
-                base_query = base_query.replace('WHERE SEARCH(', f'WHERE SEARCH(')
-                if 'WHERE SEARCH(' in base_query:
-                    # Add additional conditions after SEARCH
-                    base_query = base_query.replace('RETURN n', f'AND {where_part} RETURN n')
+                where_conditions.extend(filter_queries)
             
-            query = base_query.replace('RETURN n', f'RETURN {get_entity_node_return_query(driver.provider).strip()}')
+            # Build complete query
+            query = f"""
+            MATCH (n:Entity)
+            WHERE {' AND '.join(where_conditions)}
+            RETURN {node_return_fields}
+            ORDER BY n.name
+            LIMIT {limit}
+            """
         else:
             query = (
                 get_nodes_query(
@@ -877,24 +943,58 @@ async def node_similarity_search(
             return entity_nodes
         return []
     else:
-        query = (
+        if driver.provider == GraphProvider.SPANNER:
+            # For Spanner, build a complete GQL query without score-based WHERE filtering
+            # Spanner GQL doesn't support WHERE clauses on computed score variables
+            node_return_fields = get_entity_node_return_query(driver.provider).strip()
+            search_vector_str = '[' + ', '.join(map(str, search_vector)) + ']'
+            
+            # Build complete WHERE conditions list (excluding score filter)
+            where_conditions = []
+            
+            # Add filter conditions
+            if filter_queries:
+                where_conditions.extend(filter_queries)
+            
+            # Add group filter if needed
+            if group_ids:
+                where_conditions.append('n.group_id IN UNNEST(@group_ids)')
+                filter_params['group_ids'] = group_ids
+            
+            # Build WHERE clause
+            where_clause = ''
+            if where_conditions:
+                where_clause = f"WHERE {' AND '.join(where_conditions)}"
+            
+            # Build complete query with vector similarity computed in RETURN
+            # We'll order by similarity and let the limit handle the filtering
+            query = f"""
+            MATCH (n:Entity)
+            {where_clause}
+            RETURN {node_return_fields},
+                   COSINE_DISTANCE(n.name_embedding, {search_vector_str}) AS similarity_distance
+            ORDER BY similarity_distance ASC
+            LIMIT {limit}
             """
-                                                                                                                MATCH (n:Entity)
-                                                                                                                """
-            + filter_query
-            + """
-            WITH n, """
-            + get_vector_cosine_func_query('n.name_embedding', search_vector_var, driver.provider)
-            + """ AS score
-            WHERE score > $min_score
-            RETURN
-            """
-            + get_entity_node_return_query(driver.provider)
-            + """
-            ORDER BY score DESC
-            LIMIT $limit
-            """
-        )
+        else:
+            query = (
+                """
+                MATCH (n:Entity)
+                """
+                + filter_query
+                + """
+                WITH n, """
+                + get_vector_cosine_func_query('n.name_embedding', search_vector_var, driver.provider)
+                + """ AS score
+                WHERE score > $min_score
+                RETURN
+                """
+                + get_entity_node_return_query(driver.provider)
+                + """
+                ORDER BY score DESC
+                LIMIT $limit
+                """
+            )
 
         records, _, _ = await driver.execute_query(
             query,
@@ -1086,23 +1186,45 @@ async def episode_fulltext_search(
         else:
             return []
     else:
-        query = (
-            get_nodes_query('episode_content', '$query', limit=limit, provider=driver.provider)
-            + """
-            YIELD node AS episode, score
+        if driver.provider == GraphProvider.SPANNER:
+            # For Spanner, build a complete GQL query without YIELD patterns
+            # Build complete WHERE conditions list
+            where_conditions = []
+            
+            # Add search conditions using LIKE pattern matching
+            where_conditions.append("(COALESCE(e.content, '') LIKE CONCAT('%', @query, '%') OR COALESCE(e.name, '') LIKE CONCAT('%', @query, '%'))")
+            
+            # Add group filter if needed
+            if group_ids:
+                where_conditions.append('e.group_id IN UNNEST(@group_ids)')
+                filter_params['group_ids'] = group_ids
+            
+            # Build complete query
+            query = f"""
             MATCH (e:Episodic)
-            WHERE e.uuid = episode.uuid
+            WHERE {' AND '.join(where_conditions)}
+            RETURN {EPISODIC_NODE_RETURN}
+            ORDER BY e.name
+            LIMIT {limit}
             """
-            + group_filter_query
-            + """
-            RETURN
-            """
-            + EPISODIC_NODE_RETURN
-            + """
-            ORDER BY score DESC
-            LIMIT $limit
-            """
-        )
+        else:
+            query = (
+                get_nodes_query('episode_content', '$query', limit=limit, provider=driver.provider)
+                + """
+                YIELD node AS episode, score
+                MATCH (e:Episodic)
+                WHERE e.uuid = episode.uuid
+                """
+                + group_filter_query
+                + """
+                RETURN
+                """
+                + EPISODIC_NODE_RETURN
+                + """
+                ORDER BY score DESC
+                LIMIT $limit
+                """
+            )
 
         records, _, _ = await driver.execute_query(
             query, query=fuzzy_query, limit=limit, routing_='r', **filter_params
@@ -1168,22 +1290,44 @@ async def community_fulltext_search(
         else:
             return []
     else:
-        query = (
-            get_nodes_query('community_name', '$query', limit=limit, provider=driver.provider)
-            + yield_query
-            + """
-            WITH c, score
+        if driver.provider == GraphProvider.SPANNER:
+            # For Spanner, build a complete GQL query without YIELD patterns
+            # Build complete WHERE conditions list
+            where_conditions = []
+            
+            # Add search conditions using LIKE pattern matching
+            where_conditions.append("COALESCE(c.name, '') LIKE CONCAT('%', @query, '%')")
+            
+            # Add group filter if needed
+            if group_ids:
+                where_conditions.append('c.group_id IN UNNEST(@group_ids)')
+                filter_params['group_ids'] = group_ids
+            
+            # Build complete query
+            query = f"""
+            MATCH (c:Community)
+            WHERE {' AND '.join(where_conditions)}
+            RETURN {COMMUNITY_NODE_RETURN}
+            ORDER BY c.name
+            LIMIT {limit}
             """
-            + group_filter_query
-            + """
-            RETURN
-            """
-            + COMMUNITY_NODE_RETURN
-            + """
-            ORDER BY score DESC
-            LIMIT $limit
-            """
-        )
+        else:
+            query = (
+                get_nodes_query('community_name', '$query', limit=limit, provider=driver.provider)
+                + yield_query
+                + """
+                WITH c, score
+                """
+                + group_filter_query
+                + """
+                RETURN
+                """
+                + COMMUNITY_NODE_RETURN
+                + """
+                ORDER BY score DESC
+                LIMIT $limit
+                """
+            )
 
         records, _, _ = await driver.execute_query(
             query, query=fuzzy_query, limit=limit, routing_='r', **filter_params
@@ -1270,25 +1414,45 @@ async def community_similarity_search(
         if driver.provider == GraphProvider.KUZU:
             search_vector_var = f'CAST($search_vector AS FLOAT[{len(search_vector)}])'
 
-        query = (
+        if driver.provider == GraphProvider.SPANNER:
+            # For Spanner, build a complete GQL query without score-based WHERE filtering
+            search_vector_str = '[' + ', '.join(map(str, search_vector)) + ']'
+            
+            # Build WHERE clause for group filter
+            where_clause = ''
+            if group_ids:
+                where_clause = 'WHERE c.group_id IN UNNEST(@group_ids)'
+                query_params['group_ids'] = group_ids
+            
+            # Build complete query with vector similarity computed in RETURN
+            query = f"""
+            MATCH (c:Community)
+            {where_clause}
+            RETURN {COMMUNITY_NODE_RETURN},
+                   COSINE_DISTANCE(c.name_embedding, {search_vector_str}) AS similarity_distance
+            ORDER BY similarity_distance ASC
+            LIMIT {limit}
             """
-                                                                                                                MATCH (c:Community)
-                                                                                                                """
-            + group_filter_query
-            + """
-            WITH c,
-            """
-            + get_vector_cosine_func_query('c.name_embedding', search_vector_var, driver.provider)
-            + """ AS score
-            WHERE score > $min_score
-            RETURN
-            """
-            + COMMUNITY_NODE_RETURN
-            + """
-            ORDER BY score DESC
-            LIMIT $limit
-            """
-        )
+        else:
+            query = (
+                """
+                MATCH (c:Community)
+                """
+                + group_filter_query
+                + """
+                WITH c,
+                """
+                + get_vector_cosine_func_query('c.name_embedding', search_vector_var, driver.provider)
+                + """ AS score
+                WHERE score > $min_score
+                RETURN
+                """
+                + COMMUNITY_NODE_RETURN
+                + """
+                ORDER BY score DESC
+                LIMIT $limit
+                """
+            )
 
         records, _, _ = await driver.execute_query(
             query,
