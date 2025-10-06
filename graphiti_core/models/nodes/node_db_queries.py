@@ -49,6 +49,11 @@ def get_episode_node_save_query(provider: GraphProvider) -> str:
                 entity_edges: $entity_edges, created_at: $created_at, valid_at: $valid_at}
                 RETURN n.uuid AS uuid
             """
+        case GraphProvider.SPANNER:
+            return """
+                INSERT OR UPDATE EpisodicNode (uuid, name, group_id, created_at, source, source_description, content, valid_at, entity_edges)
+                VALUES (@uuid, @name, @group_id, @created_at, @source, @source_description, @content, @valid_at, @entity_edges)
+            """
         case _:  # Neo4j
             return """
                 MERGE (n:Episodic {uuid: $uuid})
@@ -70,6 +75,7 @@ def get_episode_node_save_bulk_query(provider: GraphProvider) -> str:
                 RETURN n.uuid AS uuid
             """
         case GraphProvider.KUZU:
+            # KUZU doesn't support UNWIND for bulk operations, so return individual query
             return """
                 MERGE (n:Episodic {uuid: $uuid})
                 SET
@@ -82,6 +88,12 @@ def get_episode_node_save_bulk_query(provider: GraphProvider) -> str:
                     n.valid_at = $valid_at,
                     n.entity_edges = $entity_edges
                 RETURN n.uuid AS uuid
+            """
+        case GraphProvider.SPANNER:
+            # SPANNER uses INSERT OR UPDATE for upsert
+            return """
+                INSERT OR UPDATE EpisodicNode (uuid, name, group_id, created_at, source, source_description, content, valid_at, entity_edges)
+                VALUES (@uuid, @name, @group_id, @created_at, @source, @source_description, @content, @valid_at, @entity_edges)
             """
         case GraphProvider.FALKORDB:
             return """
@@ -160,6 +172,11 @@ def get_entity_node_save_query(provider: GraphProvider, labels: str, has_aoss: b
                 SET n.name_embedding = join([x IN coalesce($entity_data.name_embedding, []) | toString(x) ], ",")
                 RETURN n.uuid AS uuid
             """
+        case GraphProvider.SPANNER:
+            return """
+                INSERT OR UPDATE EntityNode (uuid, name, group_id, labels, created_at, name_embedding, summary, attributes)
+                VALUES (@uuid, @name, @group_id, @labels, @created_at, @name_embedding, @summary, @attributes)
+            """
         case _:
             save_embedding_query = (
                 'WITH n CALL db.create.setNodeVectorProperty(n, "name_embedding", $entity_data.name_embedding)'
@@ -232,6 +249,12 @@ def get_entity_node_save_bulk_query(
                     n.attributes = $attributes
                 RETURN n.uuid AS uuid
             """
+        case GraphProvider.SPANNER:
+            # SPANNER uses INSERT OR UPDATE for upsert
+            return """
+                INSERT OR UPDATE EntityNode (uuid, name, group_id, labels, created_at, name_embedding, summary, attributes)
+                VALUES (@uuid, @name, @group_id, @labels, @created_at, @name_embedding, @summary, @attributes)
+            """
         case _:  # Neo4j
             save_embedding_query = (
                 'WITH n, node CALL db.create.setNodeVectorProperty(n, "name_embedding", node.name_embedding)'
@@ -301,6 +324,11 @@ def get_community_node_save_query(provider: GraphProvider) -> str:
                     n.name_embedding = $name_embedding,
                     n.summary = $summary
                 RETURN n.uuid AS uuid
+            """
+        case GraphProvider.SPANNER:
+            return """
+                INSERT OR UPDATE CommunityNode (uuid, name, group_id, created_at, name_embedding, summary)
+                VALUES (@uuid, @name, @group_id, @created_at, @name_embedding, @summary)
             """
         case _:  # Neo4j
             return """

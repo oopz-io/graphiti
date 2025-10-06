@@ -145,7 +145,7 @@ async def add_nodes_and_edges_bulk_tx(
             entity_data['name_embedding'] = node.name_embedding
 
         entity_data['labels'] = list(set(node.labels + ['Entity']))
-        if driver.provider == GraphProvider.KUZU:
+        if driver.provider in (GraphProvider.KUZU, GraphProvider.SPANNER):
             attributes = convert_datetimes_to_strings(node.attributes) if node.attributes else {}
             entity_data['attributes'] = json.dumps(attributes)
         else:
@@ -174,16 +174,27 @@ async def add_nodes_and_edges_bulk_tx(
         if not bool(driver.aoss_client):
             edge_data['fact_embedding'] = edge.fact_embedding
 
-        if driver.provider == GraphProvider.KUZU:
+        if driver.provider in (GraphProvider.KUZU, GraphProvider.SPANNER):
             attributes = convert_datetimes_to_strings(edge.attributes) if edge.attributes else {}
             edge_data['attributes'] = json.dumps(attributes)
+            
+            # Spanner requires non-NULL values for timestamp fields, use far future date as default
+            if driver.provider == GraphProvider.SPANNER:
+                from datetime import datetime, timezone
+                far_future = datetime(9999, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
+                if edge_data['expired_at'] is None:
+                    edge_data['expired_at'] = far_future
+                if edge_data['valid_at'] is None:
+                    edge_data['valid_at'] = edge.created_at  # Default to creation time
+                if edge_data['invalid_at'] is None:
+                    edge_data['invalid_at'] = far_future
         else:
             edge_data.update(edge.attributes or {})
 
         edges.append(edge_data)
 
-    if driver.provider == GraphProvider.KUZU:
-        # FIXME: Kuzu's UNWIND does not currently support STRUCT[] type properly, so we insert the data one by one instead for now.
+    if driver.provider in (GraphProvider.KUZU, GraphProvider.SPANNER):
+        # FIXME: Kuzu and Spanner don't support UNWIND for bulk operations, so we insert the data one by one instead for now.
         episode_query = get_episode_node_save_bulk_query(driver.provider)
         for episode in episodes:
             await tx.run(episode_query, **episode)

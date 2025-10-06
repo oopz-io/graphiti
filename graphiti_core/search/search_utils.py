@@ -94,6 +94,13 @@ def fulltext_query(query: str, group_ids: list[str] | None, driver: GraphDriver)
         return query
     elif driver.provider == GraphProvider.FALKORDB:
         return driver.build_fulltext_query(query, group_ids, MAX_QUERY_LENGTH)
+    elif driver.provider == GraphProvider.SPANNER:
+        # Spanner uses rquery syntax which is similar to simple text queries
+        # Reference: https://cloud.google.com/spanner/docs/full-text-search
+        if len(query.split(' ')) > MAX_QUERY_LENGTH:
+            return ''
+        # Escape special characters for Spanner rquery syntax
+        return query.replace('"', '\\"')
     group_ids_filter_list = (
         [driver.fulltext_syntax + f'group_id:"{g}"' for g in group_ids]
         if group_ids is not None
@@ -282,6 +289,54 @@ async def edge_fulltext_search(
             return entity_edges
         else:
             return []
+    elif driver.provider == GraphProvider.SPANNER:
+        # Spanner full-text search for edges using SEARCH on tokenlist columns
+        filter_conditions = []
+        
+        # Build the WHERE clause with proper group_ids handling
+        if group_ids:
+            group_id_list = ', '.join([f"'{gid}'" for gid in group_ids])
+            filter_conditions.append(f'group_id IN ({group_id_list})')
+        
+        # Add label filtering if specified (will be applied in outer query)
+        if search_filter.node_labels:
+            label_filter = 'EXISTS (SELECT 1 FROM EntityNode AS node WHERE node.uuid = source_node_uuid AND ('
+            label_conditions = []
+            for label in search_filter.node_labels:
+                label_conditions.append(f"'{label}' IN UNNEST(node.labels)")
+            label_filter += ' OR '.join(label_conditions) + '))'
+            filter_conditions.append(label_filter)
+        
+        outer_where = ''
+        if filter_conditions:
+            outer_where = 'WHERE ' + ' AND '.join(filter_conditions)
+        
+        # Use subquery to keep SEARCH in proper query shape for search index
+        inner_limit = limit * 2  # Pre-calculate since Spanner doesn't support expressions in LIMIT
+        spanner_query = f"""
+            SELECT e.uuid, e.name, e.fact, e.group_id, e.created_at, e.expired_at, e.valid_at, e.invalid_at,
+                   e.source_node_uuid, e.target_node_uuid, e.fact_embedding, e.episodes, e.attributes, e.score
+            FROM (
+                SELECT uuid, name, fact, group_id, created_at, expired_at, valid_at, invalid_at,
+                       source_node_uuid, target_node_uuid, fact_embedding, episodes, attributes,
+                       COALESCE(SCORE(name_tokens, @query), 0) + COALESCE(SCORE(fact_tokens, @query), 0) as score
+                FROM EntityEdge
+                WHERE SEARCH(name_tokens, @query) OR SEARCH(fact_tokens, @query)
+                ORDER BY score DESC, uuid
+                LIMIT @inner_limit
+            ) AS e
+            {outer_where}
+            ORDER BY e.score DESC, e.uuid
+            LIMIT @limit
+        """
+        
+        records, _, _ = await driver.execute_query(
+            spanner_query,
+            query=fuzzy_query,
+            limit=limit,
+            inner_limit=inner_limit,
+            routing_='r',
+        )
     else:
         query = (
             get_relationships_query('edge_name_and_fact', limit=limit, provider=driver.provider)
@@ -446,7 +501,64 @@ async def edge_similarity_search(
             entity_edges.sort(key=lambda e: input_uuids.get(e.uuid, 0), reverse=True)
             return entity_edges
         return []
-
+    elif driver.provider == GraphProvider.SPANNER:
+        # Convert filter query to Spanner syntax
+        label_filter = ''
+        if search_filter.node_labels:
+            # Add label filtering by joining with EntityNode table
+            label_filter = ' AND EXISTS (SELECT 1 FROM EntityNode AS n WHERE n.uuid = e.source_node_uuid AND ('
+            label_conditions = []
+            for label in search_filter.node_labels:
+                label_conditions.append(f"'{label}' IN UNNEST(n.labels)")
+            label_filter += ' OR '.join(label_conditions) + '))'
+            
+        if filter_query:
+            filter_query = filter_query.replace('WHERE', 'AND')
+            # Replace $ with @ and handle IN clauses with UNNEST
+            import re
+            # Match patterns like "IN $param" and replace with "IN UNNEST(@param)" (case-insensitive)
+            filter_query = re.sub(r'\bIN\s+\$(\w+)', r'IN UNNEST(@\1)', filter_query, flags=re.IGNORECASE)
+            filter_query = re.sub(r'\bin\s+\$(\w+)', r'IN UNNEST(@\1)', filter_query)
+            # Replace any remaining $ with @
+            filter_query = filter_query.replace('$', '@')
+        else:
+            filter_query = ''
+        
+        # Spanner's COSINE_DISTANCE returns DISTANCE (0 = identical, higher = more different)
+        # Convert to similarity: similarity = 1 - distance
+        # Filter by similarity > min_score, which means distance < (1 - min_score)
+        max_distance = 1.0 - min_score
+        
+        query = f"""
+            WITH cosine_distance AS (
+                SELECT id, COSINE_DISTANCE(fact_embedding, @search_vector) as distance 
+                FROM EntityEdge
+            ), 
+            edge AS (
+                SELECT id, uuid, source_node_uuid, target_node_uuid, group_id, created_at, name, fact, 
+                       episodes, expired_at, valid_at, invalid_at, attributes 
+                FROM EntityEdge
+            )
+            SELECT e.uuid, e.source_node_uuid, e.target_node_uuid, e.group_id, e.created_at, e.name, e.fact, 
+                   e.episodes, e.expired_at, e.valid_at, e.invalid_at, e.attributes,
+                   (1.0 - c.distance) as score
+            FROM edge e 
+            JOIN cosine_distance c ON c.id = e.id
+            WHERE c.distance < @max_distance
+            {filter_query}
+            {label_filter}
+            ORDER BY c.distance ASC
+            LIMIT @limit
+        """
+        
+        records, _, _ = await driver.execute_query(
+            query,
+            search_vector=search_vector,
+            limit=limit,
+            max_distance=max_distance,
+            routing_='r',
+            **filter_params,
+        )
     else:
         query = (
             match_query
@@ -502,6 +614,45 @@ async def edge_bfs_search(
     filter_query = ''
     if filter_queries:
         filter_query = ' WHERE ' + (' AND '.join(filter_queries))
+
+    if driver.provider == GraphProvider.SPANNER:
+        # Spanner GQL-based BFS search
+        # Replace $ with @ for Spanner parameters
+        if filter_query:
+            filter_query_spanner = filter_query.replace('$', '@')
+            # Handle IN clauses with UNNEST
+            import re
+            filter_query_spanner = re.sub(r'\bIN\s+@(\w+)', r'IN UNNEST(@\1)', filter_query_spanner, flags=re.IGNORECASE)
+        else:
+            filter_query_spanner = ''
+        
+        # Build GQL query for edge BFS using quantified path patterns
+        origin_uuids = ', '.join([f"'{uuid}'" for uuid in bfs_origin_node_uuids])
+        
+        # For edges, we traverse 0 to (depth-1) hops, then match the edge as the last hop
+        max_hops_before_edge = max(0, bfs_max_depth - 1)
+        
+        spanner_query = f"""
+            GRAPH GRAPHITI
+            MATCH (origin)-[:RELATES_TO]->{{0,{max_hops_before_edge}}}()-[e:RELATES_TO]->()
+            WHERE origin.uuid IN ({origin_uuids})
+            {filter_query_spanner.replace('WHERE', 'AND') if filter_query_spanner else ''}
+            RETURN e.uuid AS uuid, e.source_node_uuid AS source_node_uuid, e.target_node_uuid AS target_node_uuid,
+                   e.group_id AS group_id, e.created_at AS created_at, e.name AS name, e.fact AS fact,
+                   e.episodes AS episodes, e.expired_at AS expired_at, e.valid_at AS valid_at, 
+                   e.invalid_at AS invalid_at, e.attributes AS attributes
+            LIMIT @limit
+        """
+        
+        records, _, _ = await driver.execute_query(
+            spanner_query,
+            limit=limit,
+            routing_='r',
+            **filter_params,
+        )
+        
+        edges = [get_entity_edge_from_record(record, driver.provider) for record in records]
+        return edges
 
     if driver.provider == GraphProvider.KUZU:
         # Kuzu stores entity edges twice with an intermediate node, so we need to match them
@@ -698,6 +849,51 @@ async def node_fulltext_search(
             return entities
         else:
             return []
+    elif driver.provider == GraphProvider.SPANNER:
+        # Spanner uses SEARCH function for full-text search
+        # Build filter conditions for the outer WHERE clause
+        filter_conditions = []
+        
+        if group_ids is not None:
+            group_id_list = ', '.join([f"'{gid}'" for gid in group_ids])
+            filter_conditions.append(f'group_id IN ({group_id_list})')
+        
+        # Add search filters (node_labels, date filters, etc.)
+        if (search_filter.node_labels or search_filter.created_at or 
+            search_filter.valid_at or search_filter.invalid_at):
+            filter_queries, _ = node_search_filter_query_constructor(
+                search_filter, driver.provider
+            )
+            filter_conditions.extend(filter_queries)
+        
+        outer_where = ''
+        if filter_conditions:
+            outer_where = 'WHERE ' + ' AND '.join(filter_conditions)
+        
+        # Spanner full-text search: Use subquery to first get search results, then filter
+        # This ensures SEARCH remains in the correct query shape for the search index
+        # Reference: https://cloud.google.com/spanner/docs/full-text-search
+        inner_limit = limit * 2  # Pre-calculate since Spanner doesn't support expressions in LIMIT
+        spanner_query = f"""
+            SELECT n.uuid, n.name, n.group_id, n.summary, n.created_at, n.name_embedding, n.labels, n.attributes
+            FROM (
+                SELECT uuid, name, group_id, summary, created_at, name_embedding, labels, attributes
+                FROM EntityNode
+                WHERE SEARCH(name_tokens, @query) OR SEARCH(summary_tokens, @query)
+                ORDER BY uuid
+                LIMIT @inner_limit
+            ) AS n
+            {outer_where}
+            LIMIT @limit
+        """
+        
+        records, _, _ = await driver.execute_query(
+            spanner_query,
+            query=fuzzy_query,
+            limit=limit,
+            inner_limit=inner_limit,
+            routing_='r',
+        )
     else:
         query = (
             get_nodes_query(
@@ -837,6 +1033,52 @@ async def node_similarity_search(
             entity_nodes.sort(key=lambda e: input_uuids.get(e.uuid, 0), reverse=True)
             return entity_nodes
         return []
+    elif driver.provider == GraphProvider.SPANNER:
+        # Convert filter query to Spanner syntax
+        if filter_query:
+            filter_query = filter_query.replace('WHERE', 'AND')
+            # Replace $ with @ and handle IN clauses with UNNEST
+            import re
+            filter_query = re.sub(r'\bIN\s+\$(\w+)', r'IN UNNEST(@\1)', filter_query, flags=re.IGNORECASE)
+            filter_query = filter_query.replace('$', '@')
+            # Replace n. with e. since we use e as the alias in this query
+            filter_query = filter_query.replace('n.', 'e.')
+        else:
+            filter_query = ''
+            
+        # Spanner's COSINE_DISTANCE actually returns DISTANCE (0 = identical, higher = more different)
+        # This is opposite to cosine similarity. We need to convert: similarity = 1 - distance
+        # Then filter by similarity > min_score, which means distance < (1 - min_score)
+        max_distance = 1.0 - min_score
+        
+        query = f"""
+            WITH cosine_distance AS (
+                SELECT id, COSINE_DISTANCE(name_embedding, @search_vector) as distance 
+                FROM EntityNode
+            ), 
+            entity AS (
+                SELECT id, uuid, name, group_id, created_at, summary, labels, attributes 
+                FROM EntityNode
+            )
+            SELECT e.uuid, e.name, e.group_id, e.created_at, e.summary, e.labels, e.attributes,
+                   (1.0 - c.distance) as score
+            FROM entity e 
+            JOIN cosine_distance c ON c.id = e.id
+            WHERE c.distance < @max_distance
+            {filter_query}
+            ORDER BY c.distance ASC
+            LIMIT @limit
+        """
+        
+        records, _, _ = await driver.execute_query(
+            query,
+            search_vector=search_vector,
+            limit=limit,
+            max_distance=max_distance,
+            routing_='r',
+            **filter_params,
+        )
+        
     else:
         query = (
             """
@@ -867,7 +1109,6 @@ async def node_similarity_search(
         )
 
     nodes = [get_entity_node_from_record(record, driver.provider) for record in records]
-
     return nodes
 
 
@@ -894,6 +1135,42 @@ async def node_bfs_search(
     filter_query = ''
     if filter_queries:
         filter_query = ' AND ' + (' AND '.join(filter_queries))
+
+    if driver.provider == GraphProvider.SPANNER:
+        # Spanner GQL-based BFS search
+        # Replace $ with @ for Spanner parameters
+        if filter_query:
+            filter_query_spanner = filter_query.replace('$', '@')
+            # Handle IN clauses with UNNEST
+            import re
+            filter_query_spanner = re.sub(r'\bIN\s+@(\w+)', r'IN UNNEST(@\1)', filter_query_spanner, flags=re.IGNORECASE)
+        else:
+            filter_query_spanner = ''
+        
+        # Build GQL query for node BFS using quantified path patterns
+        origin_uuids = ', '.join([f"'{uuid}'" for uuid in bfs_origin_node_uuids])
+        
+        # GQL query to traverse from origin nodes to connected entity nodes
+        spanner_query = f"""
+            GRAPH GRAPHITI
+            MATCH (origin)-[:RELATES_TO|MENTIONS]->{{1,{bfs_max_depth}}}(n:Entity)
+            WHERE origin.uuid IN ({origin_uuids})
+            AND n.group_id = origin.group_id
+            {filter_query_spanner}
+            RETURN n.uuid AS uuid, n.name AS name, n.group_id AS group_id, n.created_at AS created_at,
+                   n.summary AS summary, n.labels AS labels, n.attributes AS attributes
+            LIMIT @limit
+        """
+        
+        records, _, _ = await driver.execute_query(
+            spanner_query,
+            limit=limit,
+            routing_='r',
+            **filter_params,
+        )
+        
+        nodes = [get_entity_node_from_record(record, driver.provider) for record in records]
+        return nodes
 
     match_queries = [
         f"""
@@ -977,7 +1254,32 @@ async def episode_fulltext_search(
         group_filter_query += '\nAND e.group_id IN $group_ids'
         filter_params['group_ids'] = group_ids
 
-    if driver.provider == GraphProvider.NEPTUNE:
+    if driver.provider == GraphProvider.SPANNER:
+        # Spanner-specific full-text search using SEARCH() on TOKENLIST columns
+        group_filter = ''
+        if group_ids is not None:
+            group_id_list = ', '.join([f"'{gid}'" for gid in group_ids])
+            group_filter = f' AND e.group_id IN ({group_id_list})'
+        
+        spanner_query = f"""
+            SELECT e.content, e.created_at, e.valid_at, e.uuid, e.name, e.group_id, e.source_description, e.source, e.entity_edges
+            FROM EpisodicNode AS e
+            WHERE SEARCH(e.content_tokens, @query) OR SEARCH(e.source_tokens, @query) OR SEARCH(e.source_description_tokens, @query)
+            {group_filter}
+            ORDER BY e.uuid
+            LIMIT @limit
+        """
+        
+        records, _, _ = await driver.execute_query(
+            spanner_query,
+            query=fuzzy_query,
+            limit=limit,
+            routing_='r',
+        )
+        
+        episodes = [get_episodic_node_from_record(record) for record in records]
+        return episodes
+    elif driver.provider == GraphProvider.NEPTUNE:
         res = driver.run_aoss_query('episode_content', query, limit=limit)  # pyright: ignore reportAttributeAccessIssue
         if res['hits']['total']['value'] > 0:
             input_ids = []
@@ -1095,7 +1397,32 @@ async def community_fulltext_search(
     if driver.provider == GraphProvider.KUZU:
         yield_query = 'WITH node AS c, score'
 
-    if driver.provider == GraphProvider.NEPTUNE:
+    if driver.provider == GraphProvider.SPANNER:
+        # Spanner-specific full-text search using SEARCH() on TOKENLIST columns
+        group_filter = ''
+        if group_ids is not None:
+            group_id_list = ', '.join([f"'{gid}'" for gid in group_ids])
+            group_filter = f' AND c.group_id IN ({group_id_list})'
+        
+        spanner_query = f"""
+            SELECT c.uuid, c.group_id, c.name, c.created_at, c.summary, NULL as name_embedding
+            FROM CommunityNode AS c
+            WHERE SEARCH(c.name_tokens, @query)
+            {group_filter}
+            ORDER BY c.uuid
+            LIMIT @limit
+        """
+        
+        records, _, _ = await driver.execute_query(
+            spanner_query,
+            query=fuzzy_query,
+            limit=limit,
+            routing_='r',
+        )
+        
+        communities = [get_community_node_from_record(record) for record in records]
+        return communities
+    elif driver.provider == GraphProvider.NEPTUNE:
         res = driver.run_aoss_query('community_name', query, limit=limit)  # pyright: ignore reportAttributeAccessIssue
         if res['hits']['total']['value'] > 0:
             # Calculate Cosine similarity then return the edge ids
@@ -1170,7 +1497,46 @@ async def community_similarity_search(
         group_filter_query += ' WHERE c.group_id IN $group_ids'
         query_params['group_ids'] = group_ids
 
-    if driver.provider == GraphProvider.NEPTUNE:
+    if driver.provider == GraphProvider.SPANNER:
+        # Spanner's COSINE_DISTANCE returns DISTANCE (0 = identical, higher = more different)
+        # Convert to similarity: similarity = 1 - distance
+        # Filter by similarity > min_score, which means distance < (1 - min_score)
+        max_distance = 1.0 - min_score
+        
+        # Build group filter
+        group_filter = ''
+        if group_ids is not None:
+            group_id_list = ', '.join([f"'{gid}'" for gid in group_ids])
+            group_filter = f'AND c.group_id IN ({group_id_list})'
+        
+        query = f"""
+            WITH cosine_distance AS (
+                SELECT id, COSINE_DISTANCE(name_embedding, @search_vector) as distance 
+                FROM CommunityNode
+                WHERE name_embedding IS NOT NULL
+            ), 
+            community AS (
+                SELECT id, uuid, name, group_id, created_at, summary, name_embedding 
+                FROM CommunityNode
+            )
+            SELECT c.uuid, c.name, c.group_id, c.created_at, c.summary, c.name_embedding,
+                   (1.0 - d.distance) as score
+            FROM community c 
+            JOIN cosine_distance d ON d.id = c.id
+            WHERE d.distance < @max_distance
+            {group_filter}
+            ORDER BY d.distance ASC
+            LIMIT @limit
+        """
+        
+        records, _, _ = await driver.execute_query(
+            query,
+            search_vector=search_vector,
+            limit=limit,
+            max_distance=max_distance,
+            routing_='r',
+        )
+    elif driver.provider == GraphProvider.NEPTUNE:
         query = (
             """
                                                                                                                 MATCH (n:Community)
@@ -1905,6 +2271,19 @@ async def node_distance_reranker(
         MATCH (center:Entity {uuid: $center_uuid})-[:RELATES_TO]->(e:RelatesToNode_)-[:RELATES_TO]->(n:Entity {uuid: node_uuid})
         RETURN 1 AS score, node_uuid AS uuid
         """
+    elif driver.provider == GraphProvider.SPANNER:
+        # Spanner doesn't support UNWIND or graph pattern matching
+        # Use SQL to check if nodes are connected via EntityEdge
+        query = """
+        SELECT 1 AS score, n.uuid AS uuid
+        FROM EntityNode AS n
+        WHERE n.uuid IN UNNEST(@node_uuids)
+        AND EXISTS (
+            SELECT 1 FROM EntityEdge AS e
+            WHERE (e.source_node_uuid = @center_uuid AND e.target_node_uuid = n.uuid)
+               OR (e.target_node_uuid = @center_uuid AND e.source_node_uuid = n.uuid)
+        )
+        """
 
     # Find the shortest path to center node
     results, header, _ = await driver.execute_query(
@@ -1919,7 +2298,8 @@ async def node_distance_reranker(
     for result in results:
         uuid = result['uuid']
         score = result['score']
-        scores[uuid] = score
+        # Ensure score is a float for consistent sorting
+        scores[uuid] = float(score)
 
     for uuid in filtered_uuids:
         if uuid not in scores:
@@ -2093,6 +2473,20 @@ async def get_embeddings_for_edges(
             e.uuid AS uuid,
             split(e.fact_embedding, ",") AS fact_embedding
         """
+    elif driver.provider == GraphProvider.SPANNER:
+        match_query = """
+            GRAPH GRAPHITI
+            MATCH (n:Entity)-[e:RELATES_TO]-(m:Entity)
+        """
+        query = (
+            match_query
+            + """
+        WHERE e.uuid IN unnest(@edge_uuids)
+        RETURN DISTINCT
+            e.uuid AS uuid,
+            e.fact_embedding AS fact_embedding
+        """
+        )
     else:
         match_query = """
             MATCH (n:Entity)-[e:RELATES_TO]-(m:Entity)

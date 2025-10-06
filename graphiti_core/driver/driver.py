@@ -54,6 +54,7 @@ class GraphProvider(Enum):
     FALKORDB = 'falkordb'
     KUZU = 'kuzu'
     NEPTUNE = 'neptune'
+    SPANNER = 'spanner'
 
 
 aoss_indices = [

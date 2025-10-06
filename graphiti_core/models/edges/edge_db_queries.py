@@ -38,6 +38,11 @@ def get_episodic_edge_save_bulk_query(provider: GraphProvider) -> str:
                 e.created_at = $created_at
             RETURN e.uuid AS uuid
         """
+    elif provider == GraphProvider.SPANNER:
+        return """
+            INSERT OR UPDATE EpisodicEdge (uuid, source_node_uuid, target_node_uuid, group_id, created_at)
+            VALUES (@uuid, @source_node_uuid, @target_node_uuid, @group_id, @created_at)
+        """
 
     return """
         UNWIND $episodic_edges AS edge
@@ -97,6 +102,11 @@ def get_entity_edge_save_query(provider: GraphProvider, has_aoss: bool = False) 
                     e.invalid_at = $invalid_at,
                     e.attributes = $attributes
                 RETURN e.uuid AS uuid
+            """
+        case GraphProvider.SPANNER:
+            return """
+                INSERT OR UPDATE EntityEdge (uuid, source_node_uuid, target_node_uuid, group_id, created_at, name, fact, fact_embedding, episodes, expired_at, valid_at, invalid_at, attributes)
+                VALUES (@uuid, @source_node_uuid, @target_node_uuid, @group_id, @created_at, @name, @fact, @fact_embedding, @episodes, @expired_at, @valid_at, @invalid_at, @attributes)
             """
         case _:  # Neo4j
             save_embedding_query = (
@@ -162,6 +172,12 @@ def get_entity_edge_save_bulk_query(provider: GraphProvider, has_aoss: bool = Fa
                     e.attributes = $attributes
                 RETURN e.uuid AS uuid
             """
+        case GraphProvider.SPANNER:
+            # SPANNER uses INSERT OR UPDATE for upsert
+            return """
+                INSERT OR UPDATE EntityEdge (uuid, source_node_uuid, target_node_uuid, group_id, created_at, name, fact, fact_embedding, episodes, expired_at, valid_at, invalid_at, attributes)
+                VALUES (@uuid, @source_node_uuid, @target_node_uuid, @group_id, @created_at, @name, @fact, @fact_embedding, @episodes, @expired_at, @valid_at, @invalid_at, @attributes)
+            """
         case _:
             save_embedding_query = (
                 'WITH e, edge CALL db.create.setRelationshipVectorProperty(e, "fact_embedding", edge.fact_embedding)'
@@ -216,7 +232,7 @@ def get_entity_edge_return_query(provider: GraphProvider) -> str:
         e.invalid_at AS invalid_at,
     """ + (
         'e.attributes AS attributes'
-        if provider == GraphProvider.KUZU
+        if provider == GraphProvider.KUZU or provider == GraphProvider.SPANNER
         else 'properties(e) AS attributes'
     )
 
@@ -259,6 +275,11 @@ def get_community_edge_save_query(provider: GraphProvider) -> str:
                     e.group_id = $group_id,
                     e.created_at = $created_at
                 RETURN e.uuid AS uuid
+            """
+        case GraphProvider.SPANNER:
+            return """
+                INSERT OR UPDATE HAS_MEMBER (uuid, source_node_uuid, target_node_uuid, group_id, created_at)
+                VALUES (@uuid, @community_uuid, @entity_uuid, @group_id, @created_at)
             """
         case _:  # Neo4j
             return """

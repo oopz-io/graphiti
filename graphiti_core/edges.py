@@ -377,6 +377,11 @@ class EntityEdge(Edge):
                       -[:RELATES_TO]->(e:RelatesToNode_)
                       -[:RELATES_TO]->(m:Entity {uuid: $target_node_uuid})
             """
+        elif driver.provider == GraphProvider.SPANNER:
+            match_query = """
+                GRAPH GRAPHITI
+                MATCH (n:Entity {uuid: @source_node_uuid})-[e:RELATES_TO]->(m:Entity {uuid: @target_node_uuid})
+            """
 
         records, _, _ = await driver.execute_query(
             match_query
@@ -597,7 +602,7 @@ def get_episodic_edge_from_record(record: Any) -> EpisodicEdge:
 
 def get_entity_edge_from_record(record: Any, provider: GraphProvider) -> EntityEdge:
     episodes = record['episodes']
-    if provider == GraphProvider.KUZU:
+    if provider in (GraphProvider.KUZU, GraphProvider.SPANNER):
         attributes = json.loads(record['attributes']) if record['attributes'] else {}
     else:
         attributes = record['attributes']

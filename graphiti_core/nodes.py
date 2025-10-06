@@ -825,7 +825,7 @@ def get_episodic_node_from_record(record: Any) -> EpisodicNode:
 
 
 def get_entity_node_from_record(record: Any, provider: GraphProvider) -> EntityNode:
-    if provider == GraphProvider.KUZU:
+    if provider in (GraphProvider.KUZU, GraphProvider.SPANNER):
         attributes = json.loads(record['attributes']) if record['attributes'] else {}
     else:
         attributes = record['attributes']

@@ -77,7 +77,16 @@ async def build_indices_and_constraints(driver: GraphDriver, delete_existing: bo
                 LOAD fts;
                 """,
             )
-
+    if driver.provider == GraphProvider.SPANNER:
+        # Spanner uses DDL API for creating indexes
+        # Execute all DDL statements together using the DDL API
+        from graphiti_core.driver.spanner_driver import SpannerDriver
+        if isinstance(driver, SpannerDriver):
+            index_queries_list = range_indices + fulltext_indices
+            if index_queries_list:
+                await driver.execute_ddl(index_queries_list)
+        return
+    
     index_queries: list[LiteralString] = range_indices + fulltext_indices
 
     await semaphore_gather(
@@ -143,20 +152,26 @@ async def retrieve_episodes(
 
     query_params: dict = {}
     query_filter = ''
+    
     if group_ids and len(group_ids) > 0:
-        query_filter += '\nAND e.group_id IN $group_ids'
+        if driver.provider == GraphProvider.SPANNER:
+            query_filter += '\nAND e.group_id IN UNNEST($group_ids)'
+        else:
+            query_filter += '\nAND e.group_id IN $group_ids'
         query_params['group_ids'] = group_ids
 
     if source is not None:
         query_filter += '\nAND e.source = $source'
         query_params['source'] = source.name
-
+    
     query: LiteralString = (
         """
                         MATCH (e:Episodic)
                         WHERE e.valid_at <= $reference_time
                         """
+                   
         + query_filter
+        
         + """
         RETURN
         """
@@ -170,6 +185,13 @@ async def retrieve_episodes(
         LIMIT $num_episodes
         """
     )
+    if driver.provider == GraphProvider.SPANNER:
+        query = """
+            GRAPH GRAPHITI
+            """ + query
+
+        query = query.replace('$', '@')
+
     result, _, _ = await driver.execute_query(
         query,
         reference_time=reference_time,
@@ -178,4 +200,5 @@ async def retrieve_episodes(
     )
 
     episodes = [get_episodic_node_from_record(record) for record in result]
+
     return list(reversed(episodes))  # Return in chronological order
