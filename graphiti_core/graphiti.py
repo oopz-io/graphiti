@@ -83,6 +83,8 @@ from graphiti_core.utils.maintenance.edge_operations import (
     extract_edges,
     resolve_extracted_edge,
     resolve_extracted_edges,
+    get_profiling_data as get_edge_profiling_data,
+    clear_profiling_data as clear_edge_profiling_data,
 )
 from graphiti_core.utils.maintenance.graph_data_operations import (
     EPISODE_WINDOW_LEN,
@@ -93,6 +95,8 @@ from graphiti_core.utils.maintenance.node_operations import (
     extract_attributes_from_nodes,
     extract_nodes,
     resolve_extracted_nodes,
+    get_profiling_data as get_node_profiling_data,
+    clear_profiling_data as clear_node_profiling_data,
 )
 from graphiti_core.utils.ontology_utils.entity_types_utils import validate_entity_types
 
@@ -395,6 +399,7 @@ class Graphiti:
         previous_episode_uuids: list[str] | None = None,
         edge_types: dict[str, type[BaseModel]] | None = None,
         edge_type_map: dict[tuple[str, str], list[str]] | None = None,
+        profile: bool = False,
     ) -> AddEpisodeResults:
         """
         Process an episode and update the graph.
@@ -426,9 +431,15 @@ class Graphiti:
             Optional. List of entity type names to exclude from the graph. Entities classified
             into these types will not be added to the graph. Can include 'Entity' to exclude
             the default entity type.
+        edge_types : dict[str, BaseModel] | None
+            Optional. Dictionary mapping edge type names to their Pydantic model definitions.
+        edge_type_map : dict[tuple[str, str], list[str]] | None
+            Optional. Dictionary mapping pairs of entity type names to their allowed edge types.
         previous_episode_uuids : list[str] | None
             Optional.  list of episode uuids to use as the previous episodes. If this is not provided,
             the most recent episodes by created_at date will be used.
+        profile : bool
+            Optional. If True, logs detailed timing information for each step of the add_episode process.
 
         Returns
         -------
@@ -453,7 +464,11 @@ class Graphiti:
         """
         try:
             start = time()
+            profile_times: dict[str, float] = {}
             now = utc_now()
+            
+            # Start timer for validation
+            step_start = time()
 
             validate_entity_types(entity_types)
 
@@ -461,6 +476,10 @@ class Graphiti:
             validate_group_id(group_id)
             # if group_id is None, use the default group id by the provider
             group_id = group_id or get_default_group_id(self.driver.provider)
+
+            if profile:
+                profile_times['validation'] = (time() - step_start) * 1000
+                step_start = time()
 
             previous_episodes = (
                 await self.retrieve_episodes(
@@ -472,6 +491,10 @@ class Graphiti:
                 if previous_episode_uuids is None
                 else await EpisodicNode.get_by_uuids(self.driver, previous_episode_uuids)
             )
+
+            if profile:
+                profile_times['retrieve_episodes'] = (time() - step_start) * 1000
+                step_start = time()
 
             episode = (
                 await EpisodicNode.get_by_uuid(self.driver, uuid)
@@ -495,11 +518,19 @@ class Graphiti:
                 else {('Entity', 'Entity'): []}
             )
 
+            if profile:
+                profile_times['create_episode_node'] = (time() - step_start) * 1000
+                step_start = time()
+
             # Extract entities as nodes
 
             extracted_nodes = await extract_nodes(
                 self.clients, episode, previous_episodes, entity_types, excluded_entity_types
             )
+
+            if profile:
+                profile_times['extract_nodes'] = (time() - step_start) * 1000
+                step_start = time()
 
             # Extract edges and resolve nodes
             (nodes, uuid_map, _), extracted_edges = await semaphore_gather(
@@ -522,7 +553,17 @@ class Graphiti:
                 max_coroutines=self.max_coroutines,
             )
 
+            if profile:
+                profile_times['resolve_extracted_nodes_and_extract_edges'] = (
+                    time() - step_start
+                ) * 1000
+                step_start = time()
+
             edges = resolve_edge_pointers(extracted_edges, uuid_map)
+
+            if profile:
+                profile_times['resolve_edge_pointers'] = (time() - step_start) * 1000
+                step_start = time()
 
             (resolved_edges, invalidated_edges), hydrated_nodes = await semaphore_gather(
                 resolve_extracted_edges(
@@ -539,6 +580,12 @@ class Graphiti:
                 max_coroutines=self.max_coroutines,
             )
 
+            if profile:
+                profile_times['resolve_extracted_edges_and_extract_attributes'] = (
+                    time() - step_start
+                ) * 1000
+                step_start = time()
+
             entity_edges = resolved_edges + invalidated_edges
 
             episodic_edges = build_episodic_edges(nodes, episode.uuid, now)
@@ -548,9 +595,17 @@ class Graphiti:
             if not self.store_raw_episode_content:
                 episode.content = ''
 
+            if profile:
+                profile_times['build_episodic_edges'] = (time() - step_start) * 1000
+                step_start = time()
+
             await add_nodes_and_edges_bulk(
                 self.driver, [episode], episodic_edges, hydrated_nodes, entity_edges, self.embedder
             )
+
+            if profile:
+                profile_times['add_nodes_and_edges_bulk'] = (time() - step_start) * 1000
+                step_start = time()
 
             communities = []
             community_edges = []
@@ -566,8 +621,93 @@ class Graphiti:
                     ],
                     max_coroutines=self.max_coroutines,
                 )
+
+            if profile and update_communities:
+                profile_times['update_communities'] = (time() - step_start) * 1000
+
             end = time()
-            logger.info(f'Completed add_episode in {(end - start) * 1000} ms')
+            total_time = (end - start) * 1000
+
+            if profile:
+                # Retrieve detailed profiling data from sub-operations
+                node_prof = get_node_profiling_data()
+                edge_prof = get_edge_profiling_data()
+                
+                logger.info('=' * 80)
+                logger.info(f'add_episode PROFILING for: {name}')
+                logger.info('=' * 80)
+                for step_name, step_time in profile_times.items():
+                    percentage = (step_time / total_time) * 100
+                    logger.info(f'  {step_name}: {step_time:.2f} ms ({percentage:.1f}%)')
+                    
+                    # Show detailed breakdown for resolve_extracted_nodes_and_extract_edges
+                    if step_name == 'resolve_extracted_nodes_and_extract_edges':
+                        logger.info('    │')
+                        logger.info('    ├─ resolve_extracted_nodes():')
+                        logger.info('    │  │  (These run in parallel, so total may be less than sum)')
+                        
+                        if 'resolve_extracted_nodes' in node_prof:
+                            rn = node_prof['resolve_extracted_nodes']
+                            logger.info(f'    │  ├─ Collect candidates: {rn.get("collect_candidates", 0):.2f}ms')
+                            logger.info(f'    │  ├─ Build indexes: {rn.get("build_indexes", 0):.2f}ms')
+                            logger.info(f'    │  ├─ Resolve with similarity: {rn.get("resolve_similarity", 0):.2f}ms')
+                            logger.info(f'    │  ├─ Resolve with LLM: {rn.get("resolve_llm", 0):.2f}ms')
+                            logger.info(f'    │  ├─ Filter duplicates: {rn.get("filter_duplicates", 0):.2f}ms')
+                            logger.info(f'    │  └─ Subtotal: {rn.get("total", 0):.2f}ms')
+                        else:
+                            logger.info('    │  └─ (profiling data not available)')
+                            
+                        logger.info('    │')
+                        logger.info('    └─ extract_edges():')
+                        
+                        if 'extract_edges' in edge_prof:
+                            ee = edge_prof['extract_edges']
+                            logger.info(f'       ├─ Context preparation: {ee.get("context_prep", 0):.2f}ms')
+                            logger.info(f'       ├─ LLM calls: {ee.get("llm_total_time", 0):.2f}ms ({int(ee.get("llm_calls", 0))} calls)')
+                            logger.info(f'       ├─ Edge object creation: {ee.get("edge_creation", 0):.2f}ms')
+                            logger.info(f'       └─ Subtotal: {ee.get("total", 0):.2f}ms')
+                        else:
+                            logger.info('       └─ (profiling data not available)')
+                    
+                    # Show detailed breakdown for resolve_extracted_edges_and_extract_attributes
+                    if step_name == 'resolve_extracted_edges_and_extract_attributes':
+                        logger.info('    │')
+                        logger.info('    ├─ resolve_extracted_edges():')
+                        logger.info('    │  │  (These run in parallel, so total may be less than sum)')
+                        
+                        if 'resolve_extracted_edges' in edge_prof:
+                            re = edge_prof['resolve_extracted_edges']
+                            logger.info(f'    │  ├─ Create embeddings: {re.get("create_embeddings", 0):.2f}ms')
+                            logger.info(f'    │  ├─ Get existing edges: {re.get("get_existing_edges", 0):.2f}ms')
+                            logger.info(f'    │  ├─ Search related edges: {re.get("search_related_edges", 0):.2f}ms')
+                            logger.info(f'    │  ├─ Search invalidation candidates: {re.get("search_invalidation_candidates", 0):.2f}ms')
+                            logger.info(f'    │  ├─ Prepare edge types: {re.get("prepare_edge_types", 0):.2f}ms')
+                            logger.info(f'    │  ├─ Resolve individual edges (LLM): {re.get("resolve_individual_edges", 0):.2f}ms')
+                            logger.info(f'    │  ├─ Final embeddings: {re.get("final_embeddings", 0):.2f}ms')
+                            logger.info(f'    │  └─ Subtotal: {re.get("total", 0):.2f}ms')
+                        else:
+                            logger.info('    │  └─ (profiling data not available)')
+                            
+                        logger.info('    │')
+                        logger.info('    └─ extract_attributes_from_nodes():')
+                        
+                        if 'extract_attributes_from_nodes' in node_prof:
+                            ea = node_prof['extract_attributes_from_nodes']
+                            logger.info(f'       ├─ Extract attributes (LLM): {ea.get("extract_attributes_llm", 0):.2f}ms')
+                            logger.info(f'       ├─ Create embeddings: {ea.get("create_embeddings", 0):.2f}ms')
+                            logger.info(f'       └─ Subtotal: {ea.get("total", 0):.2f}ms')
+                        else:
+                            logger.info('       └─ (profiling data not available)')
+                        
+                logger.info('=' * 80)
+                logger.info(f'  TOTAL: {total_time:.2f} ms')
+                logger.info('=' * 80)
+                
+                # Clear profiling data for next run
+                clear_node_profiling_data()
+                clear_edge_profiling_data()
+            else:
+                logger.info(f'Completed add_episode in {total_time} ms')
 
             return AddEpisodeResults(
                 episode=episode,

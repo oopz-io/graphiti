@@ -81,12 +81,13 @@ async def build_indices_and_constraints(driver: GraphDriver, delete_existing: bo
         # Spanner uses DDL API for creating indexes
         # Execute all DDL statements together using the DDL API
         from graphiti_core.driver.spanner_driver import SpannerDriver
+
         if isinstance(driver, SpannerDriver):
             index_queries_list = range_indices + fulltext_indices
             if index_queries_list:
                 await driver.execute_ddl(index_queries_list)
         return
-    
+
     index_queries: list[LiteralString] = range_indices + fulltext_indices
 
     await semaphore_gather(
@@ -149,10 +150,12 @@ async def retrieve_episodes(
     Returns:
         list[EpisodicNode]: A list of EpisodicNode objects representing the retrieved episodes.
     """
+    import time
+    profile_start = time.perf_counter()
 
     query_params: dict = {}
     query_filter = ''
-    
+
     if group_ids and len(group_ids) > 0:
         if driver.provider == GraphProvider.SPANNER:
             query_filter += '\nAND e.group_id IN UNNEST($group_ids)'
@@ -163,15 +166,13 @@ async def retrieve_episodes(
     if source is not None:
         query_filter += '\nAND e.source = $source'
         query_params['source'] = source.name
-    
+
     query: LiteralString = (
         """
                         MATCH (e:Episodic)
                         WHERE e.valid_at <= $reference_time
                         """
-                   
         + query_filter
-        
         + """
         RETURN
         """
@@ -186,19 +187,34 @@ async def retrieve_episodes(
         """
     )
     if driver.provider == GraphProvider.SPANNER:
-        query = """
+        query = (
+            """
             GRAPH GRAPHITI
-            """ + query
+            """
+            + query
+        )
 
         query = query.replace('$', '@')
 
+    query_prep_time = time.perf_counter() - profile_start
+    logger.info(f'[PROFILING] retrieve_episodes - Query preparation: {query_prep_time*1000:.2f}ms')
+
+    exec_start = time.perf_counter()
     result, _, _ = await driver.execute_query(
         query,
         reference_time=reference_time,
         num_episodes=last_n,
         **query_params,
     )
+    exec_time = time.perf_counter() - exec_start
+    logger.info(f'[PROFILING] retrieve_episodes - Database execution: {exec_time*1000:.2f}ms (returned {len(result)} episodes)')
 
+    process_start = time.perf_counter()
     episodes = [get_episodic_node_from_record(record) for record in result]
+    process_time = time.perf_counter() - process_start
+    logger.info(f'[PROFILING] retrieve_episodes - Result processing: {process_time*1000:.2f}ms')
+
+    total_time = time.perf_counter() - profile_start
+    logger.info(f'[PROFILING] retrieve_episodes - TOTAL: {total_time*1000:.2f}ms')
 
     return list(reversed(episodes))  # Return in chronological order

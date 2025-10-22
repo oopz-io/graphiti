@@ -7,7 +7,23 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreed to in writing, software
+Unless required by applicable law o                # Episodic edges (MENTIONS edges between episodes and entities)
+                # Note: EpisodicEdge model doesn't have 'name' field, only base fields
+                episodic_edge_columns = ['uuid', 'source_node_uuid', 'target_node_uuid', 'group_id', 'created_at']
+                for edge in episodic_edges:
+                    edge_dict = edge.model_dump()
+                    mutation_data = {
+                        'table': 'EpisodicEdge',
+                        'columns': episodic_edge_columns,
+                        'values': [
+                            edge_dict['uuid'],
+                            edge_dict['source_node_uuid'],
+                            edge_dict['target_node_uuid'],
+                            edge_dict['group_id'],
+                            edge_dict['created_at'],
+                        ]
+                    }
+                    mutations.append(mutation_data)riting, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -122,6 +138,9 @@ async def add_nodes_and_edges_bulk_tx(
     embedder: EmbedderClient,
     driver: GraphDriver,
 ):
+    from time import time
+
+    step_start = time()
     episodes = [dict(episode) for episode in episodic_nodes]
     for episode in episodes:
         episode['source'] = str(episode['source'].value)
@@ -177,10 +196,11 @@ async def add_nodes_and_edges_bulk_tx(
         if driver.provider in (GraphProvider.KUZU, GraphProvider.SPANNER):
             attributes = convert_datetimes_to_strings(edge.attributes) if edge.attributes else {}
             edge_data['attributes'] = json.dumps(attributes)
-            
+
             # Spanner requires non-NULL values for timestamp fields, use far future date as default
             if driver.provider == GraphProvider.SPANNER:
                 from datetime import datetime, timezone
+
                 far_future = datetime(9999, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
                 if edge_data['expired_at'] is None:
                     edge_data['expired_at'] = far_future
@@ -193,20 +213,168 @@ async def add_nodes_and_edges_bulk_tx(
 
         edges.append(edge_data)
 
+    prep_time = (time() - step_start) * 1000
+    db_start = time()
+
     if driver.provider in (GraphProvider.KUZU, GraphProvider.SPANNER):
-        # FIXME: Kuzu and Spanner don't support UNWIND for bulk operations, so we insert the data one by one instead for now.
-        episode_query = get_episode_node_save_bulk_query(driver.provider)
-        for episode in episodes:
-            await tx.run(episode_query, **episode)
-        entity_node_query = get_entity_node_save_bulk_query(driver.provider, nodes)
-        for node in nodes:
-            await tx.run(entity_node_query, **node)
-        entity_edge_query = get_entity_edge_save_bulk_query(driver.provider)
-        for edge in edges:
-            await tx.run(entity_edge_query, **edge)
-        episodic_edge_query = get_episodic_edge_save_bulk_query(driver.provider)
-        for edge in episodic_edges:
-            await tx.run(episodic_edge_query, **edge.model_dump())
+        logger.info(f'[PROFILING] Data preparation: {prep_time:.2f}ms')
+        logger.info(
+            f'[PROFILING] Starting inserts for {len(episodes)} episodes, {len(nodes)} nodes, {len(edges)} entity edges, {len(episodic_edges)} episodic edges'
+        )
+
+        if driver.provider == GraphProvider.SPANNER:
+            # Use Mutation API for optimal bulk insert performance
+            # Mutations are 2-5x faster than Batch DML as they bypass SQL parsing
+            logger.info(
+                '[PROFILING] Using Spanner MUTATION API - direct bulk inserts without SQL parsing'
+            )
+            insert_start = time()
+
+            # Build mutations list
+            mutations = []
+            
+            # Add episode inserts as mutations
+            if episodes:
+                episode_columns = ['source', 'source_description', 'content', 'entity_edges', 
+                                  'uuid', 'name', 'group_id', 'created_at', 'valid_at']
+                for episode in episodes:
+                    mutation_data = {
+                        'table': 'EpisodicNode',
+                        'columns': episode_columns,
+                        'values': [
+                            episode['source'],
+                            episode.get('source_description', ''),
+                            episode.get('content', ''),
+                            episode.get('entity_edges', []),
+                            episode['uuid'],
+                            episode['name'],
+                            episode['group_id'],
+                            episode['created_at'],
+                            episode['valid_at'],
+                        ]
+                    }
+                    mutations.append(mutation_data)
+
+            # Add entity node inserts as mutations
+            if nodes:
+                node_columns = ['uuid', 'name', 'group_id', 'labels', 'created_at', 
+                               'name_embedding', 'summary', 'attributes']
+                for node in nodes:
+                    mutation_data = {
+                        'table': 'EntityNode',
+                        'columns': node_columns,
+                        'values': [
+                            node['uuid'],
+                            node['name'],
+                            node['group_id'],
+                            node.get('labels', []),
+                            node['created_at'],
+                            node.get('name_embedding', []),
+                            node.get('summary', ''),
+                            node.get('attributes', '{}'),
+                        ]
+                    }
+                    mutations.append(mutation_data)
+
+            # Add entity edge inserts as mutations
+            if edges:
+                edge_columns = ['uuid', 'source_node_uuid', 'target_node_uuid', 'name', 'fact',
+                               'group_id', 'episodes', 'created_at', 'expired_at', 'valid_at', 
+                               'invalid_at', 'fact_embedding', 'attributes', 'labels']
+                for edge in edges:
+                    mutation_data = {
+                        'table': 'EntityEdge',
+                        'columns': edge_columns,
+                        'values': [
+                            edge['uuid'],
+                            edge['source_node_uuid'],
+                            edge['target_node_uuid'],
+                            edge['name'],
+                            edge['fact'],
+                            edge['group_id'],
+                            edge.get('episodes', []),
+                            edge['created_at'],
+                            edge.get('expired_at'),
+                            edge.get('valid_at'),
+                            edge.get('invalid_at'),
+                            edge.get('fact_embedding', []),
+                            edge.get('attributes', '{}'),
+                            edge.get('labels', []),
+                        ]
+                    }
+                    mutations.append(mutation_data)
+
+            # Add episodic edge inserts as mutations
+            if episodic_edges:
+                # Note: EpisodicEdge model doesn't have 'name' field, only base fields
+                episodic_edge_columns = ['uuid', 'source_node_uuid', 'target_node_uuid', 
+                                        'group_id', 'created_at']
+                for edge in episodic_edges:
+                    edge_dict = edge.model_dump()
+                    mutation_data = {
+                        'table': 'EpisodicEdge',
+                        'columns': episodic_edge_columns,
+                        'values': [
+                            edge_dict['uuid'],
+                            edge_dict['source_node_uuid'],
+                            edge_dict['target_node_uuid'],
+                            edge_dict['group_id'],
+                            edge_dict['created_at'],
+                        ]
+                    }
+                    mutations.append(mutation_data)
+
+            # Execute ALL inserts as mutations
+            logger.info(
+                f'[PROFILING]   - Executing {len(mutations)} mutations ({len(episodes)} episodes + {len(nodes)} nodes + {len(edges)} entity edges + {len(episodic_edges)} episodic edges)'
+            )
+            await tx.run_mutations(mutations)  # type: ignore[attr-defined]
+
+            total_time = (time() - insert_start) * 1000
+            avg_time_per_mutation = total_time / len(mutations) if mutations else 0
+            logger.info(
+                f'[PROFILING]   - Mutations completed: {total_time:.2f}ms ({len(mutations)} total mutations, {avg_time_per_mutation:.2f}ms per mutation)'
+            )
+        else:
+            # KUZU - keep original one-by-one logic
+            insert_start = time()
+            episode_query = get_episode_node_save_bulk_query(driver.provider)
+            for episode in episodes:
+                await tx.run(episode_query, **episode)
+            episodes_time = (time() - insert_start) * 1000
+            logger.info(
+                f'[PROFILING]   - Episodes inserted: {episodes_time:.2f}ms ({len(episodes)} rows, {episodes_time / len(episodes) if episodes else 0:.2f}ms per row)'
+            )
+
+            insert_start = time()
+            entity_node_query = get_entity_node_save_bulk_query(driver.provider, nodes)
+            for node in nodes:
+                await tx.run(entity_node_query, **node)
+            nodes_time = (time() - insert_start) * 1000
+            logger.info(
+                f'[PROFILING]   - Entity nodes inserted: {nodes_time:.2f}ms ({len(nodes)} rows, {nodes_time / len(nodes) if nodes else 0:.2f}ms per row)'
+            )
+
+            insert_start = time()
+            entity_edge_query = get_entity_edge_save_bulk_query(driver.provider)
+            for edge in edges:
+                await tx.run(entity_edge_query, **edge)
+            entity_edges_time = (time() - insert_start) * 1000
+            logger.info(
+                f'[PROFILING]   - Entity edges inserted: {entity_edges_time:.2f}ms ({len(edges)} rows, {entity_edges_time / len(edges) if edges else 0:.2f}ms per row)'
+            )
+
+            insert_start = time()
+            episodic_edge_query = get_episodic_edge_save_bulk_query(driver.provider)
+            for edge in episodic_edges:
+                await tx.run(episodic_edge_query, **edge.model_dump())
+            episodic_edges_time = (time() - insert_start) * 1000
+            logger.info(
+                f'[PROFILING]   - Episodic edges inserted: {episodic_edges_time:.2f}ms ({len(episodic_edges)} rows, {episodic_edges_time / len(episodic_edges) if episodic_edges else 0:.2f}ms per row)'
+            )
+
+        total_db_time = (time() - db_start) * 1000
+        logger.info(f'[PROFILING] Total database write time: {total_db_time:.2f}ms')
     else:
         await tx.run(get_episode_node_save_bulk_query(driver.provider), episodes=episodes)
         await tx.run(

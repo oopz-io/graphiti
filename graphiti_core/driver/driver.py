@@ -22,20 +22,23 @@ from abc import ABC, abstractmethod
 from collections.abc import Coroutine
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from dotenv import load_dotenv
 
 from graphiti_core.embedder.client import EMBEDDING_DIM
 
-try:
+if TYPE_CHECKING:
     from opensearchpy import AsyncOpenSearch, helpers
+else:
+    try:
+        from opensearchpy import AsyncOpenSearch, helpers
 
-    _HAS_OPENSEARCH = True
-except ImportError:
-    OpenSearch = None
-    helpers = None
-    _HAS_OPENSEARCH = False
+        _HAS_OPENSEARCH = True
+    except ImportError:
+        AsyncOpenSearch = None  # type: ignore
+        helpers = None
+        _HAS_OPENSEARCH = False
 
 logger = logging.getLogger(__name__)
 
@@ -172,7 +175,7 @@ class GraphDriver(ABC):
         ''  # Neo4j (default) syntax does not require a prefix for fulltext queries
     )
     _database: str
-    aoss_client: AsyncOpenSearch | None  # type: ignore
+    aoss_client: 'AsyncOpenSearch | None'  # type: ignore
 
     @abstractmethod
     def execute_query(self, cypher_query_: str, **kwargs: Any) -> Coroutine:

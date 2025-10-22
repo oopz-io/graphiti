@@ -55,6 +55,19 @@ from graphiti_core.utils.maintenance.edge_operations import (
 
 logger = logging.getLogger(__name__)
 
+# Module-level storage for profiling data
+_profiling_data: dict[str, dict[str, float]] = {}
+
+
+def get_profiling_data() -> dict[str, dict[str, float]]:
+    """Get the profiling data collected from node operations."""
+    return _profiling_data.copy()
+
+
+def clear_profiling_data():
+    """Clear the profiling data storage."""
+    _profiling_data.clear()
+
 
 async def extract_nodes_reflexion(
     llm_client: LLMClient,
@@ -317,15 +330,34 @@ async def resolve_extracted_nodes(
     existing_nodes_override: list[EntityNode] | None = None,
 ) -> tuple[list[EntityNode], dict[str, str], list[tuple[EntityNode, EntityNode]]]:
     """Search for existing nodes, resolve deterministic matches, then escalate holdouts to the LLM dedupe prompt."""
+    from time import time
+    
+    start_total = time()
+    step_start = time()
+    
+    # Initialize profiling data for this function
+    _profiling_data['resolve_extracted_nodes'] = {}
+    
     llm_client = clients.llm_client
     driver = clients.driver
+    
+    # Step 1: Collect candidate nodes
     existing_nodes = await _collect_candidate_nodes(
         clients,
         extracted_nodes,
         existing_nodes_override,
     )
+    collect_time = (time() - step_start) * 1000
+    _profiling_data['resolve_extracted_nodes']['collect_candidates'] = collect_time
+    logger.info(f'[PROFILING] resolve_extracted_nodes - Collect candidates: {collect_time:.2f}ms ({len(existing_nodes)} nodes)')
+    step_start = time()
 
+    # Step 2: Build candidate indexes
     indexes: DedupCandidateIndexes = _build_candidate_indexes(existing_nodes)
+    index_time = (time() - step_start) * 1000
+    _profiling_data['resolve_extracted_nodes']['build_indexes'] = index_time
+    logger.info(f'[PROFILING] resolve_extracted_nodes - Build indexes: {index_time:.2f}ms')
+    step_start = time()
 
     state = DedupResolutionState(
         resolved_nodes=[None] * len(extracted_nodes),
@@ -334,8 +366,14 @@ async def resolve_extracted_nodes(
     )
     node_duplicates: list[tuple[EntityNode, EntityNode]] = []
 
+    # Step 3: Resolve with similarity
     _resolve_with_similarity(extracted_nodes, indexes, state)
+    similarity_time = (time() - step_start) * 1000
+    _profiling_data['resolve_extracted_nodes']['resolve_similarity'] = similarity_time
+    logger.info(f'[PROFILING] resolve_extracted_nodes - Resolve with similarity: {similarity_time:.2f}ms')
+    step_start = time()
 
+    # Step 4: Resolve with LLM
     await _resolve_with_llm(
         llm_client,
         extracted_nodes,
@@ -346,6 +384,10 @@ async def resolve_extracted_nodes(
         previous_episodes,
         entity_types,
     )
+    llm_time = (time() - step_start) * 1000
+    _profiling_data['resolve_extracted_nodes']['resolve_llm'] = llm_time
+    logger.info(f'[PROFILING] resolve_extracted_nodes - Resolve with LLM: {llm_time:.2f}ms')
+    step_start = time()
 
     for idx, node in enumerate(extracted_nodes):
         if state.resolved_nodes[idx] is None:
@@ -357,9 +399,17 @@ async def resolve_extracted_nodes(
         [(node.name, node.uuid) for node in state.resolved_nodes if node is not None],
     )
 
+    # Step 5: Filter existing duplicates
     new_node_duplicates: list[
         tuple[EntityNode, EntityNode]
     ] = await filter_existing_duplicate_of_edges(driver, node_duplicates)
+    filter_time = (time() - step_start) * 1000
+    _profiling_data['resolve_extracted_nodes']['filter_duplicates'] = filter_time
+    logger.info(f'[PROFILING] resolve_extracted_nodes - Filter duplicates: {filter_time:.2f}ms')
+    
+    total_time = (time() - start_total) * 1000
+    _profiling_data['resolve_extracted_nodes']['total'] = total_time
+    logger.info(f'[PROFILING] resolve_extracted_nodes - TOTAL: {total_time:.2f}ms')
 
     return (
         [node for node in state.resolved_nodes if node is not None],
@@ -375,6 +425,14 @@ async def extract_attributes_from_nodes(
     previous_episodes: list[EpisodicNode] | None = None,
     entity_types: dict[str, type[BaseModel]] | None = None,
 ) -> list[EntityNode]:
+    from time import time
+    
+    start_total = time()
+    step_start = time()
+    
+    # Initialize profiling data for this function
+    _profiling_data['extract_attributes_from_nodes'] = {}
+    
     llm_client = clients.llm_client
     embedder = clients.embedder
     updated_nodes: list[EntityNode] = await semaphore_gather(
@@ -394,8 +452,21 @@ async def extract_attributes_from_nodes(
             for node in nodes
         ]
     )
+    
+    extract_time = (time() - step_start) * 1000
+    _profiling_data['extract_attributes_from_nodes']['extract_attributes_llm'] = extract_time
+    logger.info(f'[PROFILING] extract_attributes_from_nodes - Extract attributes (LLM): {extract_time:.2f}ms ({len(nodes)} nodes)')
+    step_start = time()
 
     await create_entity_node_embeddings(embedder, updated_nodes)
+    
+    embed_time = (time() - step_start) * 1000
+    _profiling_data['extract_attributes_from_nodes']['create_embeddings'] = embed_time
+    logger.info(f'[PROFILING] extract_attributes_from_nodes - Create embeddings: {embed_time:.2f}ms')
+    
+    total_time = (time() - start_total) * 1000
+    _profiling_data['extract_attributes_from_nodes']['total'] = total_time
+    logger.info(f'[PROFILING] extract_attributes_from_nodes - TOTAL: {total_time:.2f}ms')
 
     return updated_nodes
 

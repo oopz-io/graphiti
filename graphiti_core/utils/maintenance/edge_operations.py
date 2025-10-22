@@ -45,6 +45,19 @@ from graphiti_core.utils.maintenance.dedup_helpers import _normalize_string_exac
 
 logger = logging.getLogger(__name__)
 
+# Module-level storage for profiling data
+_profiling_data: dict[str, dict[str, float]] = {}
+
+
+def get_profiling_data() -> dict[str, dict[str, float]]:
+    """Get the profiling data collected from edge operations."""
+    return _profiling_data.copy()
+
+
+def clear_profiling_data():
+    """Clear the profiling data storage."""
+    _profiling_data.clear()
+
 
 def build_episodic_edges(
     entity_nodes: list[EntityNode],
@@ -93,7 +106,11 @@ async def extract_edges(
     group_id: str = '',
     edge_types: dict[str, type[BaseModel]] | None = None,
 ) -> list[EntityEdge]:
-    start = time()
+    start_total = time()
+    step_start = time()
+    
+    # Initialize profiling data for this function
+    _profiling_data['extract_edges'] = {}
 
     extract_edges_max_tokens = 16384
     llm_client = clients.llm_client
@@ -130,15 +147,29 @@ async def extract_edges(
         'custom_prompt': '',
         'ensure_ascii': clients.ensure_ascii,
     }
+    
+    prep_time = (time() - step_start) * 1000
+    _profiling_data['extract_edges']['context_prep'] = prep_time
+    logger.info(f'[PROFILING] extract_edges - Context preparation: {prep_time:.2f}ms')
+    step_start = time()
 
     facts_missed = True
     reflexion_iterations = 0
+    llm_calls = 0
+    llm_total_time = 0.0
+    
     while facts_missed and reflexion_iterations <= MAX_REFLEXION_ITERATIONS:
+        llm_call_start = time()
         llm_response = await llm_client.generate_response(
             prompt_library.extract_edges.edge(context),
             response_model=ExtractedEdges,
             max_tokens=extract_edges_max_tokens,
         )
+        llm_call_time = (time() - llm_call_start) * 1000
+        llm_total_time += llm_call_time
+        llm_calls += 1
+        logger.info(f'[PROFILING] extract_edges - LLM call #{llm_calls}: {llm_call_time:.2f}ms')
+        
         edges_data = ExtractedEdges(**llm_response).edges
 
         context['extracted_facts'] = [edge_data.fact for edge_data in edges_data]
@@ -160,11 +191,19 @@ async def extract_edges(
             context['custom_prompt'] = custom_prompt
 
             facts_missed = len(missing_facts) != 0
+    
+    _profiling_data['extract_edges']['llm_calls'] = llm_calls
+    _profiling_data['extract_edges']['llm_total_time'] = llm_total_time
+    logger.info(f'[PROFILING] extract_edges - Total LLM time ({llm_calls} calls): {llm_total_time:.2f}ms')
+    step_start = time()
 
     end = time()
-    logger.debug(f'Extracted new edges: {edges_data} in {(end - start) * 1000} ms')
+    logger.debug(f'Extracted new edges: {edges_data} in {(end - start_total) * 1000} ms')
 
     if len(edges_data) == 0:
+        total_time = (time() - start_total) * 1000
+        _profiling_data['extract_edges']['total'] = total_time
+        logger.info(f'[PROFILING] extract_edges - TOTAL: {total_time:.2f}ms (no edges extracted)')
         return []
 
     # Convert the extracted data into EntityEdge objects
@@ -216,6 +255,14 @@ async def extract_edges(
         logger.debug(
             f'Created new edge: {edge.name} from (UUID: {edge.source_node_uuid}) to (UUID: {edge.target_node_uuid})'
         )
+    
+    edge_creation_time = (time() - step_start) * 1000
+    _profiling_data['extract_edges']['edge_creation'] = edge_creation_time
+    logger.info(f'[PROFILING] extract_edges - Edge object creation: {edge_creation_time:.2f}ms ({len(edges)} edges)')
+    
+    total_time = (time() - start_total) * 1000
+    _profiling_data['extract_edges']['total'] = total_time
+    logger.info(f'[PROFILING] extract_edges - TOTAL: {total_time:.2f}ms')
 
     logger.debug(f'Extracted edges: {[(e.name, e.uuid) for e in edges]}')
 
@@ -230,10 +277,23 @@ async def resolve_extracted_edges(
     edge_types: dict[str, type[BaseModel]],
     edge_type_map: dict[tuple[str, str], list[str]],
 ) -> tuple[list[EntityEdge], list[EntityEdge]]:
+    from time import time
+    
+    start_total = time()
+    step_start = time()
+    
+    # Initialize profiling data for this function
+    _profiling_data['resolve_extracted_edges'] = {}
+    
     driver = clients.driver
     llm_client = clients.llm_client
     embedder = clients.embedder
+    
     await create_entity_edge_embeddings(embedder, extracted_edges)
+    embed_time = (time() - step_start) * 1000
+    _profiling_data['resolve_extracted_edges']['create_embeddings'] = embed_time
+    logger.info(f'[PROFILING] resolve_extracted_edges - Create embeddings: {embed_time:.2f}ms')
+    step_start = time()
 
     valid_edges_list: list[list[EntityEdge]] = await semaphore_gather(
         *[
@@ -241,6 +301,10 @@ async def resolve_extracted_edges(
             for edge in extracted_edges
         ]
     )
+    get_edges_time = (time() - step_start) * 1000
+    _profiling_data['resolve_extracted_edges']['get_existing_edges'] = get_edges_time
+    logger.info(f'[PROFILING] resolve_extracted_edges - Get existing edges: {get_edges_time:.2f}ms')
+    step_start = time()
 
     related_edges_results: list[SearchResults] = await semaphore_gather(
         *[
@@ -254,6 +318,10 @@ async def resolve_extracted_edges(
             for extracted_edge, valid_edges in zip(extracted_edges, valid_edges_list, strict=True)
         ]
     )
+    search_related_time = (time() - step_start) * 1000
+    _profiling_data['resolve_extracted_edges']['search_related_edges'] = search_related_time
+    logger.info(f'[PROFILING] resolve_extracted_edges - Search related edges: {search_related_time:.2f}ms')
+    step_start = time()
 
     related_edges_lists: list[list[EntityEdge]] = [result.edges for result in related_edges_results]
 
@@ -269,6 +337,10 @@ async def resolve_extracted_edges(
             for extracted_edge in extracted_edges
         ]
     )
+    search_invalidation_time = (time() - step_start) * 1000
+    _profiling_data['resolve_extracted_edges']['search_invalidation_candidates'] = search_invalidation_time
+    logger.info(f'[PROFILING] resolve_extracted_edges - Search invalidation candidates: {search_invalidation_time:.2f}ms')
+    step_start = time()
 
     edge_invalidation_candidates: list[list[EntityEdge]] = [
         result.edges for result in edge_invalidation_candidate_results
@@ -309,6 +381,11 @@ async def resolve_extracted_edges(
                 extracted_edge_types[type_name] = type_model
 
         edge_types_lst.append(extracted_edge_types)
+    
+    prep_time = (time() - step_start) * 1000
+    _profiling_data['resolve_extracted_edges']['prepare_edge_types'] = prep_time
+    logger.info(f'[PROFILING] resolve_extracted_edges - Prepare edge types: {prep_time:.2f}ms')
+    step_start = time()
 
     # resolve edges with related edges in the graph and find invalidation candidates
     results: list[tuple[EntityEdge, list[EntityEdge], list[EntityEdge]]] = list(
@@ -333,6 +410,11 @@ async def resolve_extracted_edges(
             ]
         )
     )
+    
+    resolve_time = (time() - step_start) * 1000
+    _profiling_data['resolve_extracted_edges']['resolve_individual_edges'] = resolve_time
+    logger.info(f'[PROFILING] resolve_extracted_edges - Resolve individual edges (LLM): {resolve_time:.2f}ms')
+    step_start = time()
 
     resolved_edges: list[EntityEdge] = []
     invalidated_edges: list[EntityEdge] = []
@@ -349,6 +431,14 @@ async def resolve_extracted_edges(
         create_entity_edge_embeddings(embedder, resolved_edges),
         create_entity_edge_embeddings(embedder, invalidated_edges),
     )
+    
+    final_embed_time = (time() - step_start) * 1000
+    _profiling_data['resolve_extracted_edges']['final_embeddings'] = final_embed_time
+    logger.info(f'[PROFILING] resolve_extracted_edges - Final embeddings: {final_embed_time:.2f}ms')
+    
+    total_time = (time() - start_total) * 1000
+    _profiling_data['resolve_extracted_edges']['total'] = total_time
+    logger.info(f'[PROFILING] resolve_extracted_edges - TOTAL: {total_time:.2f}ms')
 
     return resolved_edges, invalidated_edges
 

@@ -18,18 +18,21 @@ import asyncio
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from logging import INFO
+from typing import Any
 
+import functions_framework
 from dotenv import load_dotenv
+from flask import Request
 
 from graphiti_core import Graphiti
-from graphiti_core.nodes import EpisodeType
-from graphiti_core.search.search_config_recipes import NODE_HYBRID_SEARCH_RRF
-from graphiti_core.driver.spanner_driver import SpannerDriver
-from graphiti_core.llm_client.gemini_client import GeminiClient, LLMConfig
-from graphiti_core.embedder.gemini import GeminiEmbedder, GeminiEmbedderConfig
 from graphiti_core.cross_encoder.gemini_reranker_client import GeminiRerankerClient
+from graphiti_core.driver.spanner_driver import SpannerDriver
+from graphiti_core.embedder.gemini import GeminiEmbedder, GeminiEmbedderConfig
+from graphiti_core.llm_client.gemini_client import GeminiClient, LLMConfig
+from graphiti_core.nodes import EpisodeType
 
 #################################################
 # CONFIGURATION
@@ -54,7 +57,11 @@ spanner_instance_id = os.environ.get('SPANNER_INSTANCE_ID')
 spanner_database_id = os.environ.get('SPANNER_DATABASE_ID')
 
 # API key for Gemini LLM and Embedder
-api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or os.environ.get("GOOGLE_GENAI_API_KEY")
+api_key = (
+    os.environ.get('GEMINI_API_KEY')
+    or os.environ.get('GOOGLE_API_KEY')
+    or os.environ.get('GOOGLE_GENAI_API_KEY')
+)
 
 if not spanner_project_id or not spanner_instance_id or not spanner_database_id:
     raise ValueError('SPANNER_PROJECT_ID, SPANNER_INSTANCE_ID, and SPANNER_DATABASE_ID must be set')
@@ -62,103 +69,116 @@ if not spanner_project_id or not spanner_instance_id or not spanner_database_id:
 if not api_key:
     raise ValueError('GEMINI_API_KEY or GOOGLE_API_KEY or GOOGLE_GENAI_API_KEY must be set')
 
-async def main():
-    #################################################
-    # INITIALIZATION
-    #################################################
-    # Connect to Spanner and set up Graphiti indices
-    # This is required before using other Graphiti
-    # functionality
-    #################################################
 
+async def process_episodes(episodes: list[dict[str, Any]]) -> dict[str, Any]:
+    """
+    Process a list of episodes and return profiling results.
+
+    Args:
+        episodes: List of episode dictionaries with 'content', 'type', and 'description' keys
+
+    Returns:
+        Dictionary with profiling results and summary
+    """
     # Initialize Graphiti with Spanner connection
-    spanner = SpannerDriver(project_id=spanner_project_id,
-        instance_id=spanner_instance_id, database_id=spanner_database_id)
+    # Use await to properly initialize the session pool before any operations
+    spanner = await SpannerDriver.create(
+        project_id=spanner_project_id,
+        instance_id=spanner_instance_id,
+        database_id=spanner_database_id,
+    )
     graphiti = Graphiti(
         graph_driver=spanner,
-         llm_client=GeminiClient(
-            config=LLMConfig(
-            api_key=api_key,
-            model="gemini-2.5-flash"
-            )
-        ),
+        llm_client=GeminiClient(config=LLMConfig(api_key=api_key, model='gemini-2.5-flash')),
         embedder=GeminiEmbedder(
-            config=GeminiEmbedderConfig(
-            api_key=api_key,
-            embedding_model="embedding-001"
-            )
+            config=GeminiEmbedderConfig(api_key=api_key, embedding_dim=768, embedding_model='gemini-embedding-001')
         ),
         cross_encoder=GeminiRerankerClient(
             config=LLMConfig(
-            api_key=api_key, 
-            #model="gemini-2.0-flash-exp"
+                api_key=api_key,
+                # model="gemini-2.0-flash-exp"
             )
-        )
+        ),
     )
 
     try:
         # Initialize the graph database with graphiti's indices. This only needs to be done once.
         await graphiti.build_indices_and_constraints()
 
-        #################################################
-        # ADDING EPISODES
-        #################################################
-        # Episodes are the primary units of information
-        # in Graphiti. They can be text or structured JSON
-        # and are automatically processed to extract entities
-        # and relationships.
-        #################################################
+        # Add episodes to the graph with profiling
+        episode_times = []
+        print('\n' + '=' * 80)
+        print('PROFILING: add_episode Performance')
+        print('=' * 80)
 
-        # Example: Add Episodes
-        # Episodes list containing both text and JSON episodes
-        episodes = [
-            {
-                'content': 'Kamala Harris is the Attorney General of California. She was previously '
-                'the district attorney for San Francisco.',
-                'type': EpisodeType.text,
-                'description': 'podcast transcript',
-            },
-            {
-                'content': 'As AG, Harris was in office from January 3, 2011 – January 3, 2017',
-                'type': EpisodeType.text,
-                'description': 'podcast transcript',
-            },
-            {
-                'content': {
-                    'name': 'Gavin Newsom',
-                    'position': 'Governor',
-                    'state': 'California',
-                    'previous_role': 'Lieutenant Governor',
-                    'previous_location': 'San Francisco',
-                },
-                'type': EpisodeType.json,
-                'description': 'podcast metadata',
-            },
-            {
-                'content': {
-                    'name': 'Gavin Newsom',
-                    'position': 'Governor',
-                    'term_start': 'January 7, 2019',
-                    'term_end': 'Present',
-                },
-                'type': EpisodeType.json,
-                'description': 'podcast metadata',
-            },
-        ]
-
-        # Add episodes to the graph
         for i, episode in enumerate(episodes):
+            episode_name = f'Freakonomics Radio {i}'
+            print(f'\nProcessing episode {i + 1}/{len(episodes)}: {episode_name}')
+            print(f'Episode type: {episode["type"].value}')
+
+            # Start timing
+            start_time = time.perf_counter()
+
             await graphiti.add_episode(
-                name=f'Freakonomics Radio {i}',
+                name=episode_name,
                 episode_body=episode['content']
                 if isinstance(episode['content'], str)
                 else json.dumps(episode['content']),
                 source=episode['type'],
                 source_description=episode['description'],
                 reference_time=datetime.now(timezone.utc),
+                profile=True,  # Enable detailed profiling
             )
-            print(f'Added episode: Freakonomics Radio {i} ({episode["type"].value})')
 
+            # End timing
+            elapsed_time = time.perf_counter() - start_time
+            episode_times.append(
+                {
+                    'episode_num': i,
+                    'episode_name': episode_name,
+                    'episode_type': episode['type'].value,
+                    'duration_seconds': elapsed_time,
+                }
+            )
+
+            print(f'✓ Completed in {elapsed_time:.3f} seconds')
+
+        # Calculate profiling summary
+        total_time = sum(e['duration_seconds'] for e in episode_times)
+        avg_time = total_time / len(episode_times) if episode_times else 0
+        min_time = min(e['duration_seconds'] for e in episode_times) if episode_times else 0
+        max_time = max(e['duration_seconds'] for e in episode_times) if episode_times else 0
+
+        # Print profiling summary
+        print('\n' + '=' * 80)
+        print('PROFILING SUMMARY')
+        print('=' * 80)
+        print(f'\nTotal episodes processed: {len(episode_times)}')
+        print(f'Total time: {total_time:.3f} seconds')
+        print(f'Average time per episode: {avg_time:.3f} seconds')
+        print(f'Minimum time: {min_time:.3f} seconds')
+        print(f'Maximum time: {max_time:.3f} seconds')
+
+        print('\nDetailed breakdown:')
+        for ep in episode_times:
+            print(
+                f'  Episode {ep["episode_num"]}: {ep["duration_seconds"]:.3f}s - '
+                f'{ep["episode_name"]} ({ep["episode_type"]})'
+            )
+        print('=' * 80 + '\n')
+
+        # Return results
+        return {
+            'success': True,
+            'episodes_processed': len(episode_times),
+            'total_time_seconds': total_time,
+            'average_time_seconds': avg_time,
+            'min_time_seconds': min_time,
+            'max_time_seconds': max_time,
+            'episodes': episode_times,
+        }
+
+        """
         #################################################
         # BASIC SEARCH
         #################################################
@@ -254,18 +274,67 @@ async def main():
                 for key, value in node.attributes.items():
                     print(f'  {key}: {value}')
             print('---')
-
+        """
+    except Exception as e:
+        logger.error(f'Error processing episodes: {e}', exc_info=True)
+        return {'success': False, 'error': str(e)}
     finally:
-        #################################################
-        # CLEANUP
-        #################################################
-        # Always close the connection to Spanner when
-        # finished to properly release resources
-        #################################################
-
         # Close the connection
         await graphiti.close()
         print('\nConnection closed')
+
+async def main():
+    """
+    Main function for local testing with predefined episodes.
+    """
+    #################################################
+    # ADDING EPISODES
+    #################################################
+    # Episodes are the primary units of information
+    # in Graphiti. They can be text or structured JSON
+    # and are automatically processed to extract entities
+    # and relationships.
+    #################################################
+
+    # Example: Add Episodes
+    # Episodes list containing both text and JSON episodes
+    episodes = [
+        {
+            'content': 'Kamala Harris is the Attorney General of California. She was previously '
+            'the district attorney for San Francisco.',
+            'type': EpisodeType.text,
+            'description': 'podcast transcript',
+        },
+        {
+            'content': 'As AG, Harris was in office from January 3, 2011 – January 3, 2017',
+            'type': EpisodeType.text,
+            'description': 'podcast transcript',
+        },
+        {
+            'content': {
+                'name': 'Gavin Newsom',
+                'position': 'Governor',
+                'state': 'California',
+                'previous_role': 'Lieutenant Governor',
+                'previous_location': 'San Francisco',
+            },
+            'type': EpisodeType.json,
+            'description': 'podcast metadata',
+        },
+        {
+            'content': {
+                'name': 'Gavin Newsom',
+                'position': 'Governor',
+                'term_start': 'January 7, 2019',
+                'term_end': 'Present',
+            },
+            'type': EpisodeType.json,
+            'description': 'podcast metadata',
+        },
+    ]
+
+    result = await process_episodes(episodes)
+    print(f'\nResult: {json.dumps(result, indent=2)}')
 
 
 if __name__ == '__main__':
