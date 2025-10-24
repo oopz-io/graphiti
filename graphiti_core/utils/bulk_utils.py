@@ -141,6 +141,31 @@ async def add_nodes_and_edges_bulk_tx(
     from time import time
 
     step_start = time()
+    
+    # OPTIMIZATION 1: Batch generate embeddings in parallel before data prep
+    # This is much faster than sequential generation
+    embed_start = time()
+    
+    # Find nodes without embeddings and generate in parallel
+    nodes_needing_embeddings = [node for node in entity_nodes if node.name_embedding is None]
+    if nodes_needing_embeddings:
+        await semaphore_gather(
+            *[node.generate_name_embedding(embedder) for node in nodes_needing_embeddings]
+        )
+    
+    # Find edges without embeddings and generate in parallel
+    edges_needing_embeddings = [edge for edge in entity_edges if edge.fact_embedding is None]
+    if edges_needing_embeddings:
+        await semaphore_gather(
+            *[edge.generate_embedding(embedder) for edge in edges_needing_embeddings]
+        )
+    
+    embed_time = (time() - embed_start) * 1000
+    logger.info(f'[PROFILING] Parallel embedding generation: {embed_time:.2f}ms ({len(nodes_needing_embeddings)} nodes + {len(edges_needing_embeddings)} edges)')
+    
+    # OPTIMIZATION 2: Prepare data outside transaction for faster commit
+    prep_start = time()
+    
     episodes = [dict(episode) for episode in episodic_nodes]
     for episode in episodes:
         episode['source'] = str(episode['source'].value)
@@ -149,9 +174,6 @@ async def add_nodes_and_edges_bulk_tx(
     nodes = []
 
     for node in entity_nodes:
-        if node.name_embedding is None:
-            await node.generate_name_embedding(embedder)
-
         entity_data: dict[str, Any] = {
             'uuid': node.uuid,
             'name': node.name,
@@ -174,8 +196,7 @@ async def add_nodes_and_edges_bulk_tx(
 
     edges = []
     for edge in entity_edges:
-        if edge.fact_embedding is None:
-            await edge.generate_embedding(embedder)
+        # Embedding already generated in parallel above
         edge_data: dict[str, Any] = {
             'uuid': edge.uuid,
             'source_node_uuid': edge.source_node_uuid,
