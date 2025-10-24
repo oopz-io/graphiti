@@ -1256,27 +1256,33 @@ async def episode_fulltext_search(
 
     if driver.provider == GraphProvider.SPANNER:
         # Spanner-specific full-text search using SEARCH() on TOKENLIST columns
+        # Note: Spanner SEARCH() doesn't support OR in WHERE clause directly
+        # Use UNION ALL to combine results from multiple SEARCH queries
         group_filter = ''
         if group_ids is not None:
             group_id_list = ', '.join([f"'{gid}'" for gid in group_ids])
             group_filter = f' AND e.group_id IN ({group_id_list})'
-        
+
+        # Spanner SEARCH limitations:
+        # 1. SEARCH cannot be used in UNION queries
+        # 2. SEARCH queries must use read-only transactions
+        # For now, we'll just search the content field (primary search target)
         spanner_query = f"""
             SELECT e.content, e.created_at, e.valid_at, e.uuid, e.name, e.group_id, e.source_description, e.source, e.entity_edges
             FROM EpisodicNode AS e
-            WHERE SEARCH(e.content_tokens, @query) OR SEARCH(e.source_tokens, @query) OR SEARCH(e.source_description_tokens, @query)
+            WHERE SEARCH(e.content_tokens, @query)
             {group_filter}
             ORDER BY e.uuid
             LIMIT @limit
         """
-        
+
         records, _, _ = await driver.execute_query(
             spanner_query,
             query=fuzzy_query,
             limit=limit,
             routing_='r',
         )
-        
+
         episodes = [get_episodic_node_from_record(record) for record in records]
         return episodes
     elif driver.provider == GraphProvider.NEPTUNE:

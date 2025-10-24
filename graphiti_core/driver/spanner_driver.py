@@ -963,6 +963,7 @@ class SpannerDriver(GraphDriver):
                     name_embedding ARRAY<FLOAT64>(vector_length=>768),
                     group_id STRING(256),
                     created_at TIMESTAMP NOT NULL,
+                    summary STRING(MAX),
                     labels ARRAY<STRING(256)>,
                     name_tokens TOKENLIST AS (TOKENIZE_FULLTEXT(name)) HIDDEN
                 ) PRIMARY KEY(uuid)""",
@@ -1000,7 +1001,7 @@ class SpannerDriver(GraphDriver):
                       KEY (uuid)
                       LABEL Community
                       PROPERTIES (
-                        id, uuid, name, group_id, created_at, labels
+                        id, uuid, name, name_embedding, group_id, created_at, summary, labels
                       )
                   )
                   EDGE TABLES ( 
@@ -1125,15 +1126,34 @@ class SpannerDriver(GraphDriver):
                 and 'MATCH' in query_upper
                 and not found_write_keywords
             )
+            
+            # Check if this is a SEARCH query (requires read-only transaction)
+            uses_search = 'SEARCH(' in query_upper
 
             if is_read_query:
                 exec_start = time.perf_counter()
-                request = spanner.ExecuteSqlRequest(
-                    session=session_name,
-                    sql=cypher_query_,
-                    params=params_struct,
-                    param_types=param_types_t,
-                )
+                
+                # For SEARCH queries, explicitly use read-only single-use transaction
+                if uses_search:
+                    logger.info('[SEARCH] Detected SEARCH query, using read-only transaction')
+                    request = spanner.ExecuteSqlRequest(
+                        session=session_name,
+                        sql=cypher_query_,
+                        params=params_struct,
+                        param_types=param_types_t,
+                        transaction=transaction.TransactionSelector(
+                            single_use=transaction.TransactionOptions(
+                                read_only=transaction.TransactionOptions.ReadOnly()
+                            )
+                        ),
+                    )
+                else:
+                    request = spanner.ExecuteSqlRequest(
+                        session=session_name,
+                        sql=cypher_query_,
+                        params=params_struct,
+                        param_types=param_types_t,
+                    )
                 stream_start = time.perf_counter()
                 stream_result = await self.client.execute_streaming_sql(request)
                 stream_init_time = time.perf_counter() - stream_start
