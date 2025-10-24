@@ -388,9 +388,16 @@ class SpannerDriverSession(GraphDriverSession):
     async def _ensure_session(self):
         """Ensure session is created (lazy initialization)."""
         if self._session_name is None:
-            request = spanner.CreateSessionRequest(database=self._database_path)
-            session = await self._client.create_session(request)
-            self._session_name = session.name
+            if self._parent_driver and hasattr(self._parent_driver, 'session_pool'):
+                # Get session from pool
+                self._session_name = await self._parent_driver.session_pool.acquire()
+                logger.debug(f'[SESSION] Acquired session from pool: {self._session_name}')
+            else:
+                # Fallback: create new session directly (for standalone use)
+                request = spanner.CreateSessionRequest(database=self._database_path)
+                session = await self._client.create_session(request)
+                self._session_name = session.name
+                logger.debug(f'[SESSION] Created new session directly: {self._session_name}')
 
     async def __aenter__(self):
         await self._ensure_session()
@@ -594,8 +601,23 @@ class SpannerDriverSession(GraphDriverSession):
         if hasattr(self, '_pending_mutations'):
             self._pending_mutations = []
 
-        request = spanner.DeleteSessionRequest(name=self._session_name)
-        await self._client.delete_session(request)
+        # Return session to pool or delete it
+        if self._session_name:
+            if self._parent_driver and hasattr(self._parent_driver, 'session_pool'):
+                # Return to pool if we have a parent driver with session pool
+                await self._parent_driver.session_pool.release(self._session_name)
+                logger.debug(f'[SESSION] Returned session to pool: {self._session_name}')
+            else:
+                # Delete session if it was created directly (no pool)
+                try:
+                    request = spanner.DeleteSessionRequest(name=self._session_name)
+                    await self._client.delete_session(request)
+                    logger.debug(f'[SESSION] Deleted direct session: {self._session_name}')
+                except Exception as e:
+                    logger.warning(f'[SESSION] Failed to delete session: {e}')
+        
+        # Clear session reference
+        self._session_name = None
 
     async def execute_write(self, func, *args, **kwargs):
         """Execute a write operation in a transaction."""
@@ -702,7 +724,7 @@ class SpannerDriver(GraphDriver):
         instance_id: str,
         database_id: str,
         credentials: Any = None,
-        session_pool_size: int = 10,
+        session_pool_size: int = 20,
     ):
         """Initialize the Spanner driver.
         
@@ -716,7 +738,7 @@ class SpannerDriver(GraphDriver):
             instance_id: The Spanner instance ID
             database_id: The Spanner database ID
             credentials: Optional credentials object
-            session_pool_size: Maximum number of sessions in the pool (default: 10)
+            session_pool_size: Maximum number of sessions in the pool (default: 20)
         """
         super().__init__()
 
@@ -729,12 +751,12 @@ class SpannerDriver(GraphDriver):
         self._database = database_id
 
         # Initialize session pool
-        # Pre-warm with 5 sessions to handle concurrent operations during add_episode
+        # Pre-warm with sessions to handle concurrent operations during add_episode
         # (typical first episode needs 6-8 concurrent sessions)
         self.session_pool = SessionPool(
             client=self.client,
             database_path=self.database_path,
-            min_size=5,  # Pre-warm 5 sessions to reduce cold start
+            min_size=min(5, session_pool_size),  # Pre-warm up to 5 sessions, but not more than max
             max_size=session_pool_size,
         )
 
@@ -753,7 +775,7 @@ class SpannerDriver(GraphDriver):
         instance_id: str,
         database_id: str,
         credentials: Any = None,
-        session_pool_size: int = 10,
+        session_pool_size: int = 20,
     ) -> 'SpannerDriver':
         """Async factory method to create a SpannerDriver with pre-warmed session pool.
         
@@ -773,7 +795,7 @@ class SpannerDriver(GraphDriver):
             instance_id: The Spanner instance ID
             database_id: The Spanner database ID
             credentials: Optional credentials object
-            session_pool_size: Maximum number of sessions in the pool (default: 10)
+            session_pool_size: Maximum number of sessions in the pool (default: 20)
             
         Returns:
             SpannerDriver instance with pre-warmed session pool
