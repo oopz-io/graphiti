@@ -141,6 +141,7 @@ class Graphiti:
         graph_driver: GraphDriver | None = None,
         max_coroutines: int | None = None,
         ensure_ascii: bool = False,
+        generate_node_summaries: bool = True,
     ):
         """
         Initialize a Graphiti instance.
@@ -177,6 +178,11 @@ class Graphiti:
             Whether to escape non-ASCII characters in JSON serialization for prompts. Defaults to False.
             Set as False to preserve non-ASCII characters (e.g., Korean, Japanese, Chinese) in their
             original form, making them readable in LLM logs and improving model understanding.
+        generate_node_summaries : bool, optional
+            Whether to generate and update summaries for EntityNodes using LLM. Defaults to True.
+            When disabled, node summaries will be empty, which can significantly reduce LLM API calls
+            and processing time during episode ingestion. This is useful for large-scale ingestion
+            where summaries are not needed or when optimizing for performance.
 
         Returns
         -------
@@ -207,6 +213,7 @@ class Graphiti:
         self.store_raw_episode_content = store_raw_episode_content
         self.max_coroutines = max_coroutines
         self.ensure_ascii = ensure_ascii
+        self.generate_node_summaries = generate_node_summaries
         if llm_client:
             self.llm_client = llm_client
         else:
@@ -575,7 +582,7 @@ class Graphiti:
                     edge_type_map or edge_type_map_default,
                 ),
                 extract_attributes_from_nodes(
-                    self.clients, nodes, episode, previous_episodes, entity_types
+                    self.clients, nodes, episode, previous_episodes, entity_types, self.generate_node_summaries
                 ),
                 max_coroutines=self.max_coroutines,
             )
@@ -878,6 +885,7 @@ class Graphiti:
                         params[1][0],
                         params[1][0:],
                         entity_types,
+                        self.generate_node_summaries,
                     )
                     for params in extract_attributes_params
                 ]
@@ -943,6 +951,7 @@ class Graphiti:
                         episode,
                         previous_episodes,
                         entity_types,
+                        self.generate_node_summaries,
                     )
                     for episode, previous_episodes in episode_context
                 ]

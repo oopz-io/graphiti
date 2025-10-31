@@ -424,6 +424,7 @@ async def extract_attributes_from_nodes(
     episode: EpisodicNode | None = None,
     previous_episodes: list[EpisodicNode] | None = None,
     entity_types: dict[str, type[BaseModel]] | None = None,
+    generate_summaries: bool = True,
 ) -> list[EntityNode]:
     from time import time
     
@@ -448,6 +449,7 @@ async def extract_attributes_from_nodes(
                     else None
                 ),
                 clients.ensure_ascii,
+                generate_summaries,
             )
             for node in nodes
         ]
@@ -478,6 +480,7 @@ async def extract_attributes_from_node(
     previous_episodes: list[EpisodicNode] | None = None,
     entity_type: type[BaseModel] | None = None,
     ensure_ascii: bool = False,
+    generate_summary: bool = True,
 ) -> EntityNode:
     node_context: dict[str, Any] = {
         'name': node.name,
@@ -520,16 +523,22 @@ async def extract_attributes_from_node(
         else {}
     )
 
-    summary_response = await llm_client.generate_response(
-        prompt_library.extract_nodes.extract_summary(summary_context),
-        response_model=EntitySummary,
-        model_size=ModelSize.small,
-    )
+    # Only generate summary if enabled
+    if generate_summary:
+        summary_response = await llm_client.generate_response(
+            prompt_library.extract_nodes.extract_summary(summary_context),
+            response_model=EntitySummary,
+            model_size=ModelSize.small,
+        )
+        node.summary = summary_response.get('summary', '')
+    else:
+        # Keep existing summary or set to empty if none exists
+        if not node.summary:
+            node.summary = ''
 
     if has_entity_attributes and entity_type is not None:
         entity_type(**llm_response)
 
-    node.summary = summary_response.get('summary', '')
     node_attributes = {key: value for key, value in llm_response.items()}
 
     node.attributes.update(node_attributes)
