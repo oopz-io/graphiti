@@ -408,10 +408,6 @@ class SpannerDriverSession(GraphDriverSession):
 
     async def run(self, query: str, **kwargs: Any) -> Any:
         """Execute a query in this session."""
-        # Ensure schema is initialized if we have a parent driver reference
-        if self._parent_driver:
-            await self._parent_driver._ensure_schema_initialized()
-
         await self._ensure_session()
 
         # Format parameters
@@ -501,10 +497,6 @@ class SpannerDriverSession(GraphDriverSession):
         
         if not mutations_data:
             return 0
-            
-        # Ensure schema is initialized if we have a parent driver reference
-        if self._parent_driver:
-            await self._parent_driver._ensure_schema_initialized()
             
         await self._ensure_session()
         
@@ -621,10 +613,6 @@ class SpannerDriverSession(GraphDriverSession):
 
     async def execute_write(self, func, *args, **kwargs):
         """Execute a write operation in a transaction."""
-        # Ensure schema is initialized if we have a parent driver reference
-        if self._parent_driver:
-            await self._parent_driver._ensure_schema_initialized()
-
         await self._ensure_session()
 
         if not self._current_transaction:
@@ -692,25 +680,49 @@ class SpannerDriverSession(GraphDriverSession):
 class SpannerDriver(GraphDriver):
     """Google Cloud Spanner implementation of GraphDriver.
 
-    This driver automatically initializes the required schema on first use,
-    creating all necessary tables, sequences, search indexes, and property graph
-    definitions. The schema is based on the Graphiti data model and includes:
+    This driver provides flexible schema initialization control. The schema includes:
 
     - EntityNode table for storing entity nodes
     - EntityEdge table for storing relationships between entities
     - EpisodicNode table for storing episodic memory
     - CommunityNode table for storing community/cluster nodes
     - EpisodicEdge table for linking episodes to entities
+    - ContradictedEdge table for tracking edge invalidations (audit trail)
     - Full-text search indexes for content search
     - Property graph definition for graph query support
 
-    The schema initialization is idempotent - it will only create the schema
-    if it doesn't already exist.
+    Schema Initialization:
+    ----------------------
+    The driver supports two modes for schema initialization:
     
-    Note: For optimal performance with pre-warmed session pool, use the async
+    1. Automatic (ensure_schema=True): Schema is created during driver creation
+       via the create() factory method. This is convenient for development and testing.
+       
+    2. Manual (ensure_schema=False, default): Schema initialization is skipped.
+       You must create the schema manually or call initialize_schema() explicitly.
+       This is recommended for production where you want explicit control.
+
+    The schema initialization is idempotent - it will only create objects that
+    don't already exist.
+    
+    Usage:
+    ------
+    For optimal performance with pre-warmed session pool, use the async
     factory method `create()` instead of direct instantiation:
     
-        driver = await SpannerDriver.create(project_id, instance_id, database_id)
+        # Development/testing with automatic schema setup
+        driver = await SpannerDriver.create(
+            project_id, instance_id, database_id,
+            ensure_schema=True
+        )
+        
+        # Production with manual schema control
+        driver = await SpannerDriver.create(
+            project_id, instance_id, database_id,
+            ensure_schema=False  # default
+        )
+        # Optionally call initialize_schema() when you're ready
+        await driver.initialize_schema()
     
     This will pre-warm the session pool before returning the driver instance.
     """
@@ -725,6 +737,7 @@ class SpannerDriver(GraphDriver):
         database_id: str,
         credentials: Any = None,
         session_pool_size: int = 20,
+        ensure_schema: bool = False,
     ):
         """Initialize the Spanner driver.
         
@@ -739,6 +752,10 @@ class SpannerDriver(GraphDriver):
             database_id: The Spanner database ID
             credentials: Optional credentials object
             session_pool_size: Maximum number of sessions in the pool (default: 20)
+            ensure_schema: If True, schema will be initialized when using the create() factory method.
+                         If False (default), schema initialization is skipped entirely.
+                         This parameter only takes effect when using create(), not the constructor.
+                         Set to True if you want automatic schema setup.
         """
         super().__init__()
 
@@ -760,9 +777,10 @@ class SpannerDriver(GraphDriver):
             max_size=session_pool_size,
         )
 
-        # Initialize schema automatically for Spanner
-        # This is done synchronously during construction to ensure the database is ready
-        # before any operations are attempted
+        # Store the schema initialization flag
+        # If ensure_schema is True, schema will be initialized on first operation
+        # If False, schema initialization is completely skipped
+        self._ensure_schema_flag = ensure_schema
         self._schema_initialized = False
         
         # Flag to track if session pool has been pre-warmed
@@ -776,6 +794,7 @@ class SpannerDriver(GraphDriver):
         database_id: str,
         credentials: Any = None,
         session_pool_size: int = 20,
+        ensure_schema: bool = False,
     ) -> 'SpannerDriver':
         """Async factory method to create a SpannerDriver with pre-warmed session pool.
         
@@ -787,7 +806,8 @@ class SpannerDriver(GraphDriver):
             driver = await SpannerDriver.create(
                 project_id='my-project',
                 instance_id='my-instance',
-                database_id='my-database'
+                database_id='my-database',
+                ensure_schema=True  # Automatically set up database schema
             )
         
         Args:
@@ -796,21 +816,22 @@ class SpannerDriver(GraphDriver):
             database_id: The Spanner database ID
             credentials: Optional credentials object
             session_pool_size: Maximum number of sessions in the pool (default: 20)
+            ensure_schema: If True, initialize the database schema during driver creation.
+                         If False (default), schema initialization is skipped entirely.
             
         Returns:
             SpannerDriver instance with pre-warmed session pool
         """
-        driver = cls(project_id, instance_id, database_id, credentials, session_pool_size)
+        driver = cls(project_id, instance_id, database_id, credentials, session_pool_size, ensure_schema)
         await driver._ensure_pool_initialized()
+        
+        # Initialize schema if requested
+        if ensure_schema:
+            await driver.initialize_schema()
+            driver._schema_initialized = True
+        
         return driver
 
-    async def _ensure_schema_initialized(self) -> None:
-        return
-        """Ensure the schema is initialized. This is called lazily on first operation."""
-        if not self._schema_initialized:
-            await self.initialize_schema()
-            self._schema_initialized = True
-    
     async def _ensure_pool_initialized(self) -> None:
         """Ensure session pool is pre-warmed before first use."""
         if not self._pool_initialized:
@@ -822,8 +843,21 @@ class SpannerDriver(GraphDriver):
             logger.info('[SPANNER DRIVER] Pool already initialized, skipping')
 
     async def initialize_schema(self) -> None:
-        return
-        """Initialize the database schema if it doesn't exist."""
+        """Initialize the database schema if it doesn't exist.
+        
+        This method creates all necessary tables, sequences, search indexes, and
+        property graph definitions required by Graphiti. It is idempotent - running
+        it multiple times is safe as it will skip creation of objects that already exist.
+        
+        Note: This method is automatically called during driver creation if
+        ensure_schema=True was passed to create(). You can also call it manually
+        to set up the schema at a specific time.
+        """
+        # Skip if schema already initialized
+        if self._schema_initialized:
+            logger.info('Schema already initialized, skipping')
+            return
+            
         try:
             # Check if schema already exists by checking for one of the main tables
             # We check for EntityNode table as the primary indicator
@@ -1078,8 +1112,9 @@ class SpannerDriver(GraphDriver):
             logger.warning(
                 "delete_existing=True is not supported for Spanner driver. Schema will be created if it doesn't exist."
             )
-
-        await self.initialize_schema()
+            # Reset the flag so schema can be recreated
+            self._schema_initialized = False
+            await self.initialize_schema()
 
     async def execute_query(
         self, cypher_query_: LiteralString, **kwargs: Any
@@ -1087,13 +1122,6 @@ class SpannerDriver(GraphDriver):
         """Execute a query directly without session management."""
         import time
         start_time = time.perf_counter()
-        
-        # Ensure schema is initialized before executing any queries
-        schema_start = time.perf_counter()
-        await self._ensure_schema_initialized()
-        schema_time = time.perf_counter() - schema_start
-        if schema_time > 0.001:  # Only log if > 1ms
-            logger.info(f'[PROFILING] execute_query - Schema check: {schema_time*1000:.2f}ms')
 
         # Acquire a session from the pool
         session_start = time.perf_counter()
