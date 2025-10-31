@@ -17,6 +17,7 @@ limitations under the License.
 import logging
 from datetime import datetime
 from time import time
+from typing import Any
 
 from dotenv import load_dotenv
 from pydantic import BaseModel
@@ -141,6 +142,7 @@ class Graphiti:
         graph_driver: GraphDriver | None = None,
         max_coroutines: int | None = None,
         ensure_ascii: bool = False,
+        save_contradicted_edges: bool = False,
         generate_node_summaries: bool = True,
     ):
         """
@@ -178,6 +180,11 @@ class Graphiti:
             Whether to escape non-ASCII characters in JSON serialization for prompts. Defaults to False.
             Set as False to preserve non-ASCII characters (e.g., Korean, Japanese, Chinese) in their
             original form, making them readable in LLM logs and improving model understanding.
+        save_contradicted_edges : bool, optional
+            Whether to save contradicted edges to a separate table for audit purposes. 
+            This is a Spanner-specific feature. Defaults to False.
+            When enabled, edges that are invalidated due to contradictions will be saved to the 
+            ContradictedEdge table with full context about what edge invalidated them and when.
         generate_node_summaries : bool, optional
             Whether to generate and update summaries for EntityNodes using LLM. Defaults to True.
             When disabled, node summaries will be empty, which can significantly reduce LLM API calls
@@ -213,6 +220,7 @@ class Graphiti:
         self.store_raw_episode_content = store_raw_episode_content
         self.max_coroutines = max_coroutines
         self.ensure_ascii = ensure_ascii
+        self.save_contradicted_edges = save_contradicted_edges
         self.generate_node_summaries = generate_node_summaries
         if llm_client:
             self.llm_client = llm_client
@@ -580,6 +588,7 @@ class Graphiti:
                     nodes,
                     edge_types or {},
                     edge_type_map or edge_type_map_default,
+                    self.save_contradicted_edges,
                 ),
                 extract_attributes_from_nodes(
                     self.clients, nodes, episode, previous_episodes, entity_types, self.generate_node_summaries
@@ -979,6 +988,7 @@ class Graphiti:
                         hydrated_nodes,
                         edge_types or {},
                         edge_type_map or edge_type_map_default,
+                        self.save_contradicted_edges,
                     )
                     for episode in episodes
                 ]
@@ -1163,6 +1173,74 @@ class Graphiti:
         nodes = await get_mentioned_nodes(self.driver, episodes)
 
         return SearchResults(edges=edges, nodes=nodes)
+
+    async def get_contradictions(
+        self,
+        group_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """
+        Retrieve contradictions for a specific group.
+        
+        This method retrieves edges that were invalidated due to contradictions,
+        providing audit trail and proof of why information changed.
+        
+        **Note**: This feature is only available when using SpannerDriver with
+        `save_contradicted_edges=True` enabled.
+        
+        Parameters
+        ----------
+        group_id : str | None, optional
+            The group ID to filter contradictions. If None, uses the default group ID
+            for the current driver.
+        limit : int, optional
+            Maximum number of contradictions to retrieve. Defaults to 100.
+            
+        Returns
+        -------
+        list[dict[str, any]]
+            List of contradiction records, each containing:
+            - contradiction_uuid: UUID of the contradiction record
+            - invalidated: dict with 'uuid', 'fact', and 'created_at' of the invalidated edge
+            - invalidating: dict with 'uuid', 'fact', and 'created_at' of the invalidating edge
+            - invalidated_at: Timestamp when invalidation occurred
+            - created_at: Timestamp when contradiction was recorded
+            
+        Raises
+        ------
+        ValueError
+            If the driver is not a SpannerDriver instance.
+            
+        Examples
+        --------
+        Get all contradictions for the default group:
+        
+        >>> contradictions = await graphiti.get_contradictions()
+        >>> for c in contradictions:
+        ...     print(f"{c['invalidated']['fact']} → {c['invalidating']['fact']}")
+        ...     print(f"Old edge created: {c['invalidated']['created_at']}")
+        ...     print(f"New edge created: {c['invalidating']['created_at']}")
+        
+        Get contradictions for a specific group:
+        
+        >>> contradictions = await graphiti.get_contradictions(group_id='user-123', limit=50)
+        
+        Notes
+        -----
+        This method requires:
+        1. SpannerDriver as the graph driver
+        2. `save_contradicted_edges=True` when initializing Graphiti
+        3. At least one contradiction to have occurred
+        
+        If no contradictions are found, returns an empty list.
+        """
+        from graphiti_core.utils.contradicted_edges_utils import get_all_contradictions_for_group
+        
+        # Use default group_id if not provided
+        if group_id is None:
+            group_id = get_default_group_id(self.driver.provider)
+        
+        return await get_all_contradictions_for_group(self.driver, group_id, limit)
 
     async def add_triplet(
         self, source_node: EntityNode, edge: EntityEdge, target_node: EntityNode

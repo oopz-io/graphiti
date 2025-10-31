@@ -942,6 +942,9 @@ class SpannerDriver(GraphDriver):
                 """CREATE SEQUENCE EpisodicEdgeSequence OPTIONS (
                     sequence_kind='bit_reversed_positive'
                 )""",
+                """CREATE SEQUENCE ContradictedEdgeSequence OPTIONS (
+                    sequence_kind='bit_reversed_positive'
+                )""",
                 # Create tables
                 """CREATE TABLE EntityNode (
                   id INT64 DEFAULT (GET_NEXT_SEQUENCE_VALUE(SEQUENCE EntityNodeSequence)),
@@ -1010,11 +1013,27 @@ class SpannerDriver(GraphDriver):
                   group_id STRING(256),
                   created_at TIMESTAMP NOT NULL
                 ) PRIMARY KEY(uuid)""",
+                """CREATE TABLE ContradictedEdge (
+                  id INT64 DEFAULT (GET_NEXT_SEQUENCE_VALUE(SEQUENCE ContradictedEdgeSequence)),
+                  uuid STRING(256),
+                  invalidated_edge_uuid STRING(256),
+                  invalidating_edge_uuid STRING(256),
+                  invalidated_fact STRING(MAX),
+                  invalidating_fact STRING(MAX),
+                  invalidated_at TIMESTAMP NOT NULL,
+                  group_id STRING(256),
+                  invalidated_edge_data JSON,
+                  invalidating_edge_data JSON,
+                  created_at TIMESTAMP NOT NULL,
+                  invalidated_fact_tokens TOKENLIST AS (TOKENIZE_FULLTEXT(invalidated_fact)) HIDDEN,
+                  invalidating_fact_tokens TOKENLIST AS (TOKENIZE_FULLTEXT(invalidating_fact)) HIDDEN
+                ) PRIMARY KEY(uuid)""",
                 # Create search indexes
                 """CREATE SEARCH INDEX EntityNode_search_index ON EntityNode(name_tokens, summary_tokens)""",
                 """CREATE SEARCH INDEX EntityEdge_search_index ON EntityEdge(name_tokens, fact_tokens)""",
                 """CREATE SEARCH INDEX EpisodicNode_search_index ON EpisodicNode(content_tokens, source_tokens, source_description_tokens)""",
                 """CREATE SEARCH INDEX CommunityNode_search_index ON CommunityNode(name_tokens)""",
+                """CREATE SEARCH INDEX ContradictedEdge_search_index ON ContradictedEdge(invalidated_fact_tokens, invalidating_fact_tokens)""",
             ]
 
             # Property graph definition - created separately to handle partial schema scenarios
@@ -1296,6 +1315,144 @@ class SpannerDriver(GraphDriver):
         # Set a reference to the parent driver so the session can ensure schema initialization
         session._parent_driver = self
         return session
+
+    async def save_contradicted_edges(
+        self,
+        invalidated_edges: list[tuple[Any, Any]],
+        group_id: str,
+    ) -> None:
+        """
+        Save contradicted edges to the ContradictedEdge table.
+        
+        This is a Spanner-specific feature that stores edges that have been invalidated
+        due to contradictions for audit and analysis purposes.
+        
+        Args:
+            invalidated_edges: List of tuples (invalidated_edge, invalidating_edge) representing
+                             edges that were invalidated and the new edges that invalidated them
+            group_id: The group_id for all the edges
+        """
+        from uuid import uuid4
+        from datetime import datetime, timezone
+        import json
+        
+        if not invalidated_edges:
+            return
+            
+        logger.info(f'[CONTRADICTED EDGES] Saving {len(invalidated_edges)} contradicted edges to Spanner')
+        
+        # Prepare mutation rows
+        mutations = []
+        now = datetime.now(timezone.utc)
+        
+        for invalidated_edge, invalidating_edge in invalidated_edges:
+            # Create a unique UUID for this contradicted edge record
+            record_uuid = str(uuid4())
+            
+            # Serialize full edge data as JSON for audit trail
+            invalidated_data = {
+                'uuid': invalidated_edge.uuid,
+                'name': invalidated_edge.name,
+                'fact': invalidated_edge.fact,
+                'source_node_uuid': invalidated_edge.source_node_uuid,
+                'target_node_uuid': invalidated_edge.target_node_uuid,
+                'episodes': invalidated_edge.episodes,
+                'created_at': invalidated_edge.created_at.isoformat() if invalidated_edge.created_at else None,
+                'valid_at': invalidated_edge.valid_at.isoformat() if invalidated_edge.valid_at else None,
+                'invalid_at': invalidated_edge.invalid_at.isoformat() if invalidated_edge.invalid_at else None,
+                'expired_at': invalidated_edge.expired_at.isoformat() if invalidated_edge.expired_at else None,
+                'attributes': invalidated_edge.attributes,
+            }
+            
+            invalidating_data = {
+                'uuid': invalidating_edge.uuid,
+                'name': invalidating_edge.name,
+                'fact': invalidating_edge.fact,
+                'source_node_uuid': invalidating_edge.source_node_uuid,
+                'target_node_uuid': invalidating_edge.target_node_uuid,
+                'episodes': invalidating_edge.episodes,
+                'created_at': invalidating_edge.created_at.isoformat() if invalidating_edge.created_at else None,
+                'valid_at': invalidating_edge.valid_at.isoformat() if invalidating_edge.valid_at else None,
+                'attributes': invalidating_edge.attributes,
+            }
+            
+            # Create mutation for ContradictedEdge table
+            from graphiti_core.driver.spanner_driver import _convert_value_for_mutation
+            
+            mutation = types.Mutation(
+                insert=types.Mutation.Write(
+                    table='ContradictedEdge',
+                    columns=[
+                        'uuid',
+                        'invalidated_edge_uuid',
+                        'invalidating_edge_uuid',
+                        'invalidated_fact',
+                        'invalidating_fact',
+                        'invalidated_at',
+                        'group_id',
+                        'invalidated_edge_data',
+                        'invalidating_edge_data',
+                        'created_at',
+                    ],
+                    values=[
+                        [
+                            _convert_value_for_mutation(record_uuid),
+                            _convert_value_for_mutation(invalidated_edge.uuid),
+                            _convert_value_for_mutation(invalidating_edge.uuid),
+                            _convert_value_for_mutation(invalidated_edge.fact),
+                            _convert_value_for_mutation(invalidating_edge.fact),
+                            _convert_value_for_mutation(invalidated_edge.invalid_at if invalidated_edge.invalid_at else now),
+                            _convert_value_for_mutation(group_id),
+                            _convert_value_for_mutation(json.dumps(invalidated_data)),
+                            _convert_value_for_mutation(json.dumps(invalidating_data)),
+                            _convert_value_for_mutation(now),
+                        ]
+                    ],
+                )
+            )
+            mutations.append(mutation)
+        
+        # Execute mutations using a transaction
+        session_name = await self.session_pool.acquire()
+        try:
+            # Begin transaction
+            options = transaction.TransactionOptions(
+                read_write=transaction.TransactionOptions.ReadWrite()
+            )
+            begin_request = spanner.BeginTransactionRequest(
+                session=session_name, options=options
+            )
+            transaction_obj = await self.client.begin_transaction(begin_request)
+            
+            commit_succeeded = False
+            try:
+                # Commit with mutations
+                commit_request = spanner.CommitRequest(
+                    session=session_name,
+                    transaction_id=transaction_obj.id,
+                    mutations=mutations,
+                )
+                await self.client.commit(commit_request)
+                commit_succeeded = True
+                logger.info(f'[CONTRADICTED EDGES] Successfully saved {len(mutations)} contradicted edge records')
+                
+            except Exception as e:
+                # Only rollback if commit didn't succeed
+                if not commit_succeeded:
+                    try:
+                        rollback_request = spanner.RollbackRequest(
+                            session=session_name, transaction_id=transaction_obj.id
+                        )
+                        await self.client.rollback(rollback_request)
+                        logger.debug('[CONTRADICTED EDGES] Transaction rolled back')
+                    except Exception as rollback_error:
+                        logger.debug(f'[CONTRADICTED EDGES] Rollback failed (transaction may have already ended): {rollback_error}')
+                
+                logger.error(f'[CONTRADICTED EDGES] Error saving contradicted edges: {e}')
+                raise
+                
+        finally:
+            await self.session_pool.release(session_name)
 
     async def close(self) -> None:
         """Close the driver and its connections, including the session pool."""

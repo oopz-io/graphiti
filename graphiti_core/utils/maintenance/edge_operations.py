@@ -276,6 +276,7 @@ async def resolve_extracted_edges(
     entities: list[EntityNode],
     edge_types: dict[str, type[BaseModel]],
     edge_type_map: dict[tuple[str, str], list[str]],
+    save_contradicted_edges: bool = False,
 ) -> tuple[list[EntityEdge], list[EntityEdge]]:
     from time import time
     
@@ -418,14 +419,34 @@ async def resolve_extracted_edges(
 
     resolved_edges: list[EntityEdge] = []
     invalidated_edges: list[EntityEdge] = []
+    contradicted_edge_pairs: list[tuple[EntityEdge, EntityEdge]] = []  # (invalidated, invalidating)
+    
     for result in results:
         resolved_edge = result[0]
         invalidated_edge_chunk = result[1]
 
         resolved_edges.append(resolved_edge)
         invalidated_edges.extend(invalidated_edge_chunk)
+        
+        # Track which edges were invalidated by this resolved edge
+        for invalidated_edge in invalidated_edge_chunk:
+            contradicted_edge_pairs.append((invalidated_edge, resolved_edge))
 
     logger.debug(f'Resolved edges: {[(e.name, e.uuid) for e in resolved_edges]}')
+    
+    # Save contradicted edges to Spanner if enabled
+    if save_contradicted_edges and contradicted_edge_pairs:
+        from graphiti_core.driver.spanner_driver import SpannerDriver
+        
+        if isinstance(driver, SpannerDriver):
+            try:
+                # Get group_id from the first resolved edge
+                group_id = resolved_edges[0].group_id if resolved_edges else episode.group_id
+                await driver.save_contradicted_edges(contradicted_edge_pairs, group_id)
+            except Exception as e:
+                logger.error(f'Failed to save contradicted edges: {e}', exc_info=True)
+        else:
+            logger.debug('save_contradicted_edges is enabled but driver is not SpannerDriver, skipping')
 
     await semaphore_gather(
         create_entity_edge_embeddings(embedder, resolved_edges),

@@ -218,17 +218,13 @@ async def add_nodes_and_edges_bulk_tx(
             attributes = convert_datetimes_to_strings(edge.attributes) if edge.attributes else {}
             edge_data['attributes'] = json.dumps(attributes)
 
-            # Spanner requires non-NULL values for timestamp fields, use far future date as default
+            # Spanner-specific handling for optional timestamp fields
             if driver.provider == GraphProvider.SPANNER:
-                from datetime import datetime, timezone
-
-                far_future = datetime(9999, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
-                if edge_data['expired_at'] is None:
-                    edge_data['expired_at'] = far_future
+                # Keep expired_at and invalid_at as NULL (None) by default
+                # Only set valid_at to creation time if it's None
                 if edge_data['valid_at'] is None:
                     edge_data['valid_at'] = edge.created_at  # Default to creation time
-                if edge_data['invalid_at'] is None:
-                    edge_data['invalid_at'] = far_future
+                # expired_at and invalid_at remain None (NULL in database)
         else:
             edge_data.update(edge.attributes or {})
 
