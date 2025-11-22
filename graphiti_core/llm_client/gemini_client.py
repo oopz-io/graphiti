@@ -198,6 +198,52 @@ class GeminiClient(LLMClient):
         # 3. Use model-specific maximum or return DEFAULT_GEMINI_MAX_TOKENS
         return self._get_max_tokens_for_model(model)
 
+    def _sanitize_schema(self, schema: dict[str, typing.Any]) -> dict[str, typing.Any]:
+        """
+        Sanitize JSON schema for Vertex AI compatibility.
+        Ensures 'type' field is present and handles Pydantic v2 schema artifacts.
+        """
+        if not isinstance(schema, dict):
+            return schema
+
+        # Ensure type is present
+        if 'type' not in schema:
+            if 'properties' in schema:
+                schema['type'] = 'object'
+            elif 'items' in schema:
+                schema['type'] = 'array'
+            elif 'enum' in schema:
+                schema['type'] = 'string'
+            elif 'anyOf' in schema:
+                # Handle Optional[Type] which often becomes anyOf [Type, null]
+                # Vertex AI prefers nullable: true or just the type if it's strict
+                # For now, let's try to pick the non-null type
+                non_null_types = [t for t in schema['anyOf'] if t.get('type') != 'null']
+                if len(non_null_types) == 1:
+                    # Replace anyOf with the single type and mark nullable (if supported)
+                    # or just use the type.
+                    # Recursively sanitize the chosen type
+                    sanitized = self._sanitize_schema(non_null_types[0])
+                    schema.update(sanitized)
+                    del schema['anyOf']
+                    # schema['nullable'] = True # Vertex might not support this directly in all versions
+            
+        # Recursively sanitize properties
+        if 'properties' in schema:
+            for prop in schema['properties'].values():
+                self._sanitize_schema(prop)
+        
+        # Recursively sanitize items
+        if 'items' in schema:
+            self._sanitize_schema(schema['items'])
+            
+        # Recursively sanitize definitions
+        if '$defs' in schema:
+            for def_schema in schema['$defs'].values():
+                self._sanitize_schema(def_schema)
+                
+        return schema
+
     def salvage_json(self, raw_output: str) -> dict[str, typing.Any] | None:
         """
         Attempt to salvage a JSON object if the raw output is truncated.
@@ -258,13 +304,17 @@ class GeminiClient(LLMClient):
             gemini_messages: typing.Any = []
             # If a response model is provided, add schema for structured output
             system_prompt = ''
+            sanitized_schema = None
             if response_model is not None:
                 # Get the schema from the Pydantic model
                 pydantic_schema = response_model.model_json_schema()
+                
+                # Sanitize schema for Vertex AI compatibility
+                sanitized_schema = self._sanitize_schema(pydantic_schema)
 
                 # Create instruction to output in the desired JSON format
                 system_prompt += (
-                    f'Output ONLY valid JSON matching this schema: {json.dumps(pydantic_schema)}.\n'
+                    f'Output ONLY valid JSON matching this schema: {json.dumps(sanitized_schema)}.\n'
                     'Do not include any explanatory text before or after the JSON.\n\n'
                 )
 
@@ -292,7 +342,7 @@ class GeminiClient(LLMClient):
                 temperature=self.temperature,
                 max_output_tokens=resolved_max_tokens,
                 response_mime_type='application/json' if response_model else None,
-                response_schema=response_model if response_model else None,
+                response_schema=sanitized_schema if response_model else None,
                 system_instruction=system_prompt,
                 thinking_config=self.thinking_config,
             )
