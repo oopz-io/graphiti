@@ -17,10 +17,12 @@ limitations under the License.
 import asyncio
 import json
 import logging
+import random
 import re
 from datetime import datetime
 from typing import Any
 
+from google.api_core import exceptions as google_exceptions
 from google.cloud import spanner_v1
 from google.cloud.spanner_v1 import types
 from google.cloud.spanner_v1.types import spanner, transaction
@@ -30,6 +32,69 @@ from typing_extensions import LiteralString
 from graphiti_core.driver.driver import GraphDriver, GraphDriverSession, GraphProvider
 
 logger = logging.getLogger(__name__)
+
+# Retry configuration for handling Spanner transaction conflicts (409 Aborted errors)
+# These occur when concurrent transactions conflict on the same rows
+SPANNER_RETRY_CONFIG = {
+    'max_retries': 5,           # Maximum number of retry attempts
+    'initial_delay_ms': 100,    # Initial delay before first retry (100ms)
+    'max_delay_ms': 5000,       # Maximum delay between retries (5 seconds)
+    'multiplier': 2.0,          # Exponential backoff multiplier
+    'jitter': 0.2,              # Random jitter factor (±20%)
+}
+
+
+def _calculate_retry_delay(attempt: int, config: dict = SPANNER_RETRY_CONFIG) -> float:
+    """
+    Calculate delay before next retry with exponential backoff and jitter.
+    
+    Args:
+        attempt: Current attempt number (0-based)
+        config: Retry configuration dictionary
+        
+    Returns:
+        Delay in seconds
+    """
+    # Calculate base delay with exponential backoff
+    delay_ms = config['initial_delay_ms'] * (config['multiplier'] ** attempt)
+    
+    # Cap at maximum delay
+    delay_ms = min(delay_ms, config['max_delay_ms'])
+    
+    # Add jitter (±jitter_factor)
+    jitter_range = delay_ms * config['jitter']
+    delay_ms += random.uniform(-jitter_range, jitter_range)
+    
+    # Ensure non-negative
+    delay_ms = max(delay_ms, 0)
+    
+    return delay_ms / 1000.0  # Convert to seconds
+
+
+def _is_retryable_error(error: Exception) -> bool:
+    """
+    Check if an error is retryable (transaction conflict/abort).
+    
+    Args:
+        error: The exception to check
+        
+    Returns:
+        True if the error is retryable (409 Aborted), False otherwise
+    """
+    # Check for google.api_core.exceptions.Aborted (409)
+    if isinstance(error, google_exceptions.Aborted):
+        return True
+    
+    # Check for error message patterns indicating transaction conflicts
+    error_str = str(error).lower()
+    retryable_patterns = [
+        'transaction was aborted',
+        'was wounded by a higher priority transaction',
+        'conflict on keys',
+        'concurrent transaction',
+        'aborted due to transient fault',
+    ]
+    return any(pattern in error_str for pattern in retryable_patterns)
 
 
 class SessionPool:
@@ -612,7 +677,66 @@ class SpannerDriverSession(GraphDriverSession):
         self._session_name = None
 
     async def execute_write(self, func, *args, **kwargs):
-        """Execute a write operation in a transaction."""
+        """Execute a write operation in a transaction with automatic retry on conflicts.
+        
+        This method implements exponential backoff retry logic to handle Spanner
+        transaction conflicts (409 Aborted errors) that occur when concurrent
+        transactions try to modify the same rows.
+        
+        Args:
+            func: The async function to execute within the transaction
+            *args: Positional arguments to pass to func
+            **kwargs: Keyword arguments to pass to func
+            
+        Returns:
+            The result of func
+            
+        Raises:
+            The last exception if all retries are exhausted
+        """
+        max_retries = SPANNER_RETRY_CONFIG['max_retries']
+        last_error = None
+        
+        for attempt in range(max_retries + 1):  # +1 for initial attempt
+            try:
+                return await self._execute_write_once(func, *args, **kwargs)
+            except Exception as e:
+                last_error = e
+                
+                # Check if error is retryable
+                if not _is_retryable_error(e):
+                    logger.error(f'[TRANSACTION] Non-retryable error: {e}')
+                    raise
+                
+                # Check if we have retries left
+                if attempt >= max_retries:
+                    logger.error(
+                        f'[TRANSACTION] Transaction aborted after {max_retries} retries. '
+                        f'Last error: {e}'
+                    )
+                    raise
+                
+                # Calculate delay and wait
+                delay = _calculate_retry_delay(attempt)
+                logger.warning(
+                    f'[TRANSACTION] Transaction conflict detected (attempt {attempt + 1}/{max_retries + 1}). '
+                    f'Retrying in {delay:.2f}s. Error: {str(e)[:200]}'
+                )
+                await asyncio.sleep(delay)
+                
+                # Reset session state for retry
+                # Clear any pending mutations from failed attempt
+                if hasattr(self, '_pending_mutations'):
+                    self._pending_mutations = []
+                # Clear transaction state (will be re-created on next attempt)
+                self._current_transaction = None
+                self._seqno = 0
+        
+        # Should not reach here, but just in case
+        raise last_error
+
+    async def _execute_write_once(self, func, *args, **kwargs):
+        """Execute a single write attempt (internal method used by execute_write)."""
         await self._ensure_session()
 
         if not self._current_transaction:
