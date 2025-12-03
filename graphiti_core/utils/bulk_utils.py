@@ -161,7 +161,7 @@ async def add_nodes_and_edges_bulk_tx(
         )
     
     embed_time = (time() - embed_start) * 1000
-    logger.info(f'[PROFILING] Parallel embedding generation: {embed_time:.2f}ms ({len(nodes_needing_embeddings)} nodes + {len(edges_needing_embeddings)} edges)')
+    logger.debug(f'[PROFILING] Parallel embedding generation: {embed_time:.2f}ms ({len(nodes_needing_embeddings)} nodes + {len(edges_needing_embeddings)} edges)')
     
     # OPTIMIZATION 2: Prepare data outside transaction for faster commit
     prep_start = time()
@@ -234,7 +234,7 @@ async def add_nodes_and_edges_bulk_tx(
     db_start = time()
 
     if driver.provider in (GraphProvider.KUZU, GraphProvider.SPANNER):
-        logger.info(f'[PROFILING] Data preparation: {prep_time:.2f}ms')
+        logger.debug(f'[PROFILING] Data preparation: {prep_time:.2f}ms')
         logger.info(
             f'[PROFILING] Starting inserts for {len(episodes)} episodes, {len(nodes)} nodes, {len(edges)} entity edges, {len(episodic_edges)} episodic edges'
         )
@@ -391,7 +391,7 @@ async def add_nodes_and_edges_bulk_tx(
             )
 
         total_db_time = (time() - db_start) * 1000
-        logger.info(f'[PROFILING] Total database write time: {total_db_time:.2f}ms')
+        logger.debug(f'[PROFILING] Total database write time: {total_db_time:.2f}ms')
     else:
         await tx.run(get_episode_node_save_bulk_query(driver.provider), episodes=episodes)
         await tx.run(

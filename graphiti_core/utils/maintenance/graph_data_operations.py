@@ -197,7 +197,7 @@ async def retrieve_episodes(
         query = query.replace('$', '@')
 
     query_prep_time = time.perf_counter() - profile_start
-    logger.info(f'[PROFILING] retrieve_episodes - Query preparation: {query_prep_time*1000:.2f}ms')
+    logger.debug(f'[PROFILING] retrieve_episodes - Query preparation: {query_prep_time*1000:.2f}ms')
 
     exec_start = time.perf_counter()
     result, _, _ = await driver.execute_query(
@@ -207,14 +207,14 @@ async def retrieve_episodes(
         **query_params,
     )
     exec_time = time.perf_counter() - exec_start
-    logger.info(f'[PROFILING] retrieve_episodes - Database execution: {exec_time*1000:.2f}ms (returned {len(result)} episodes)')
+    logger.debug(f'[PROFILING] retrieve_episodes - Database execution: {exec_time*1000:.2f}ms (returned {len(result)} episodes)')
 
     process_start = time.perf_counter()
     episodes = [get_episodic_node_from_record(record) for record in result]
     process_time = time.perf_counter() - process_start
-    logger.info(f'[PROFILING] retrieve_episodes - Result processing: {process_time*1000:.2f}ms')
+    logger.debug(f'[PROFILING] retrieve_episodes - Result processing: {process_time*1000:.2f}ms')
 
     total_time = time.perf_counter() - profile_start
-    logger.info(f'[PROFILING] retrieve_episodes - TOTAL: {total_time*1000:.2f}ms')
+    logger.debug(f'[PROFILING] retrieve_episodes - TOTAL: {total_time*1000:.2f}ms')
 
     return list(reversed(episodes))  # Return in chronological order

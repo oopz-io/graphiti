@@ -1270,14 +1270,14 @@ class SpannerDriver(GraphDriver):
         session_start = time.perf_counter()
         session_name = await self.session_pool.acquire()
         session_time = time.perf_counter() - session_start
-        logger.info(f'[PROFILING] execute_query - Session acquisition: {session_time*1000:.2f}ms')
+        logger.debug(f'[PROFILING] execute_query - Session acquisition: {session_time*1000:.2f}ms')
 
         try:
             # Format parameters
             param_start = time.perf_counter()
             params_struct, param_types_t = _format_spanner_params(kwargs)
             param_time = time.perf_counter() - param_start
-            logger.info(f'[PROFILING] execute_query - Parameter formatting: {param_time*1000:.2f}ms')
+            logger.debug(f'[PROFILING] execute_query - Parameter formatting: {param_time*1000:.2f}ms')
 
             rows = []
             field_names = None
@@ -1328,7 +1328,7 @@ class SpannerDriver(GraphDriver):
                 stream_start = time.perf_counter()
                 stream_result = await self.client.execute_streaming_sql(request)
                 stream_init_time = time.perf_counter() - stream_start
-                logger.info(f'[PROFILING] execute_query - Stream initialization: {stream_init_time*1000:.2f}ms')
+                logger.debug(f'[PROFILING] execute_query - Stream initialization: {stream_init_time*1000:.2f}ms')
                 
                 fetch_start = time.perf_counter()
                 async for partial_result in stream_result:
@@ -1360,8 +1360,8 @@ class SpannerDriver(GraphDriver):
                 
                 fetch_time = time.perf_counter() - fetch_start
                 exec_time = time.perf_counter() - exec_start
-                logger.info(f'[PROFILING] execute_query - Data fetching: {fetch_time*1000:.2f}ms ({len(rows)} rows)')
-                logger.info(f'[PROFILING] execute_query - Total query execution: {exec_time*1000:.2f}ms')
+                logger.debug(f'[PROFILING] execute_query - Data fetching: {fetch_time*1000:.2f}ms ({len(rows)} rows)')
+                logger.debug(f'[PROFILING] execute_query - Total query execution: {exec_time*1000:.2f}ms')
 
             else:
                 # For write queries, use transaction
@@ -1429,8 +1429,8 @@ class SpannerDriver(GraphDriver):
             cleanup_time = time.perf_counter() - cleanup_start
             
             total_time = time.perf_counter() - start_time
-            logger.info(f'[PROFILING] execute_query - Session release: {cleanup_time*1000:.2f}ms')
-            logger.info(f'[PROFILING] execute_query - TOTAL TIME: {total_time*1000:.2f}ms')
+            logger.debug(f'[PROFILING] execute_query - Session release: {cleanup_time*1000:.2f}ms')
+            logger.debug(f'[PROFILING] execute_query - TOTAL TIME: {total_time*1000:.2f}ms')
 
 
     def session(self, database: str | None = None) -> GraphDriverSession:

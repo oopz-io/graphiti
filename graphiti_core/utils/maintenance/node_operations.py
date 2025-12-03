@@ -349,14 +349,14 @@ async def resolve_extracted_nodes(
     )
     collect_time = (time() - step_start) * 1000
     _profiling_data['resolve_extracted_nodes']['collect_candidates'] = collect_time
-    logger.info(f'[PROFILING] resolve_extracted_nodes - Collect candidates: {collect_time:.2f}ms ({len(existing_nodes)} nodes)')
+    logger.debug(f'[PROFILING] resolve_extracted_nodes - Collect candidates: {collect_time:.2f}ms ({len(existing_nodes)} nodes)')
     step_start = time()
 
     # Step 2: Build candidate indexes
     indexes: DedupCandidateIndexes = _build_candidate_indexes(existing_nodes)
     index_time = (time() - step_start) * 1000
     _profiling_data['resolve_extracted_nodes']['build_indexes'] = index_time
-    logger.info(f'[PROFILING] resolve_extracted_nodes - Build indexes: {index_time:.2f}ms')
+    logger.debug(f'[PROFILING] resolve_extracted_nodes - Build indexes: {index_time:.2f}ms')
     step_start = time()
 
     state = DedupResolutionState(
@@ -370,7 +370,7 @@ async def resolve_extracted_nodes(
     _resolve_with_similarity(extracted_nodes, indexes, state)
     similarity_time = (time() - step_start) * 1000
     _profiling_data['resolve_extracted_nodes']['resolve_similarity'] = similarity_time
-    logger.info(f'[PROFILING] resolve_extracted_nodes - Resolve with similarity: {similarity_time:.2f}ms')
+    logger.debug(f'[PROFILING] resolve_extracted_nodes - Resolve with similarity: {similarity_time:.2f}ms')
     step_start = time()
 
     # Step 4: Resolve with LLM
@@ -386,7 +386,7 @@ async def resolve_extracted_nodes(
     )
     llm_time = (time() - step_start) * 1000
     _profiling_data['resolve_extracted_nodes']['resolve_llm'] = llm_time
-    logger.info(f'[PROFILING] resolve_extracted_nodes - Resolve with LLM: {llm_time:.2f}ms')
+    logger.debug(f'[PROFILING] resolve_extracted_nodes - Resolve with LLM: {llm_time:.2f}ms')
     step_start = time()
 
     for idx, node in enumerate(extracted_nodes):
@@ -405,11 +405,11 @@ async def resolve_extracted_nodes(
     ] = await filter_existing_duplicate_of_edges(driver, node_duplicates)
     filter_time = (time() - step_start) * 1000
     _profiling_data['resolve_extracted_nodes']['filter_duplicates'] = filter_time
-    logger.info(f'[PROFILING] resolve_extracted_nodes - Filter duplicates: {filter_time:.2f}ms')
+    logger.debug(f'[PROFILING] resolve_extracted_nodes - Filter duplicates: {filter_time:.2f}ms')
     
     total_time = (time() - start_total) * 1000
     _profiling_data['resolve_extracted_nodes']['total'] = total_time
-    logger.info(f'[PROFILING] resolve_extracted_nodes - TOTAL: {total_time:.2f}ms')
+    logger.debug(f'[PROFILING] resolve_extracted_nodes - TOTAL: {total_time:.2f}ms')
 
     return (
         [node for node in state.resolved_nodes if node is not None],
@@ -457,18 +457,18 @@ async def extract_attributes_from_nodes(
     
     extract_time = (time() - step_start) * 1000
     _profiling_data['extract_attributes_from_nodes']['extract_attributes_llm'] = extract_time
-    logger.info(f'[PROFILING] extract_attributes_from_nodes - Extract attributes (LLM): {extract_time:.2f}ms ({len(nodes)} nodes)')
+    logger.debug(f'[PROFILING] extract_attributes_from_nodes - Extract attributes (LLM): {extract_time:.2f}ms ({len(nodes)} nodes)')
     step_start = time()
 
     await create_entity_node_embeddings(embedder, updated_nodes)
     
     embed_time = (time() - step_start) * 1000
     _profiling_data['extract_attributes_from_nodes']['create_embeddings'] = embed_time
-    logger.info(f'[PROFILING] extract_attributes_from_nodes - Create embeddings: {embed_time:.2f}ms')
+    logger.debug(f'[PROFILING] extract_attributes_from_nodes - Create embeddings: {embed_time:.2f}ms')
     
     total_time = (time() - start_total) * 1000
     _profiling_data['extract_attributes_from_nodes']['total'] = total_time
-    logger.info(f'[PROFILING] extract_attributes_from_nodes - TOTAL: {total_time:.2f}ms')
+    logger.debug(f'[PROFILING] extract_attributes_from_nodes - TOTAL: {total_time:.2f}ms')
 
     return updated_nodes
 
