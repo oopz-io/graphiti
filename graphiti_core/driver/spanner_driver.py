@@ -1364,61 +1364,98 @@ class SpannerDriver(GraphDriver):
                 logger.debug(f'[PROFILING] execute_query - Total query execution: {exec_time*1000:.2f}ms')
 
             else:
-                # For write queries, use transaction
-                options = transaction.TransactionOptions(
-                    read_write=transaction.TransactionOptions.ReadWrite()
-                )
-                begin_request = spanner.BeginTransactionRequest(
-                    session=session_name, options=options
-                )
-                transaction_obj = await self.client.begin_transaction(begin_request)
-                try:
-                    request = spanner.ExecuteSqlRequest(
-                        session=session_name,
-                        sql=cypher_query_,
-                        params=params_struct,
-                        param_types=param_types_t,
-                        transaction={'id': transaction_obj.id},  # Set transaction ID
-                    )
-                    async for partial_result in await self.client.execute_streaming_sql(request):
-                        # Get field names from metadata
-                        if field_names is None and partial_result.metadata:
-                            field_names = [
-                                field.name for field in partial_result.metadata.row_type.fields
-                            ]
-
-                        # partial_result.values is a FLAT list of all field values
-                        # We need to group them by number of fields to reconstruct rows
-                        if field_names:
-                            num_fields = len(field_names)
-                            all_values = [
-                                _extract_value_from_protobuf(val) for val in partial_result.values
-                            ]
-
-                            # Group values into rows
-                            for i in range(0, len(all_values), num_fields):
-                                row_values = all_values[i : i + num_fields]
-                                if len(row_values) == num_fields:  # Only add complete rows
-                                    row_dict = dict(zip(field_names, row_values, strict=False))
-                                    rows.append(row_dict)
-                        else:
-                            # If no field names, just add raw values
-                            rows.extend(
-                                [_extract_value_from_protobuf(val) for val in partial_result.values]
+                # For write queries, use transaction with retry logic for conflicts
+                max_retries = SPANNER_RETRY_CONFIG['max_retries']
+                last_error = None
+                
+                for attempt in range(max_retries + 1):
+                    try:
+                        rows = []
+                        field_names = None
+                        
+                        options = transaction.TransactionOptions(
+                            read_write=transaction.TransactionOptions.ReadWrite()
+                        )
+                        begin_request = spanner.BeginTransactionRequest(
+                            session=session_name, options=options
+                        )
+                        transaction_obj = await self.client.begin_transaction(begin_request)
+                        try:
+                            request = spanner.ExecuteSqlRequest(
+                                session=session_name,
+                                sql=cypher_query_,
+                                params=params_struct,
+                                param_types=param_types_t,
+                                transaction={'id': transaction_obj.id},  # Set transaction ID
                             )
-                    # Commit the transaction
-                    commit_request = spanner.CommitRequest(
-                        session=session_name, transaction_id=transaction_obj.id
-                    )
-                    await self.client.commit(commit_request)
+                            async for partial_result in await self.client.execute_streaming_sql(request):
+                                # Get field names from metadata
+                                if field_names is None and partial_result.metadata:
+                                    field_names = [
+                                        field.name for field in partial_result.metadata.row_type.fields
+                                    ]
 
-                except Exception as e:
-                    # Rollback on error
-                    rollback_request = spanner.RollbackRequest(
-                        session=session_name, transaction_id=transaction_obj.id
-                    )
-                    await self.client.rollback(rollback_request)
-                    raise e
+                                # partial_result.values is a FLAT list of all field values
+                                # We need to group them by number of fields to reconstruct rows
+                                if field_names:
+                                    num_fields = len(field_names)
+                                    all_values = [
+                                        _extract_value_from_protobuf(val) for val in partial_result.values
+                                    ]
+
+                                    # Group values into rows
+                                    for i in range(0, len(all_values), num_fields):
+                                        row_values = all_values[i : i + num_fields]
+                                        if len(row_values) == num_fields:  # Only add complete rows
+                                            row_dict = dict(zip(field_names, row_values, strict=False))
+                                            rows.append(row_dict)
+                                else:
+                                    # If no field names, just add raw values
+                                    rows.extend(
+                                        [_extract_value_from_protobuf(val) for val in partial_result.values]
+                                    )
+                            # Commit the transaction
+                            commit_request = spanner.CommitRequest(
+                                session=session_name, transaction_id=transaction_obj.id
+                            )
+                            await self.client.commit(commit_request)
+                            # Success - break out of retry loop
+                            break
+
+                        except Exception as e:
+                            # Rollback on error
+                            try:
+                                rollback_request = spanner.RollbackRequest(
+                                    session=session_name, transaction_id=transaction_obj.id
+                                )
+                                await self.client.rollback(rollback_request)
+                            except Exception:
+                                pass  # Ignore rollback errors
+                            raise e
+                            
+                    except Exception as e:
+                        last_error = e
+                        
+                        # Check if error is retryable
+                        if not _is_retryable_error(e):
+                            logger.error(f'[TRANSACTION] Non-retryable error in execute_query: {e}')
+                            raise
+                        
+                        # Check if we have retries left
+                        if attempt >= max_retries:
+                            logger.error(
+                                f'[TRANSACTION] Write query aborted after {max_retries} retries. '
+                                f'Last error: {e}'
+                            )
+                            raise
+                        
+                        # Calculate delay and wait
+                        delay = _calculate_retry_delay(attempt)
+                        logger.warning(
+                            f'[TRANSACTION] Write conflict detected (attempt {attempt + 1}/{max_retries + 1}). '
+                            f'Retrying in {delay:.2f}s. Error: {str(e)[:200]}'
+                        )
+                        await asyncio.sleep(delay)
 
             return rows, None, None
 
