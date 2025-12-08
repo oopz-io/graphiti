@@ -91,7 +91,9 @@ async def process_episodes(episodes: list[dict[str, Any]]) -> dict[str, Any]:
         graph_driver=spanner,
         llm_client=GeminiClient(config=LLMConfig(api_key=api_key, model='gemini-2.5-flash')),
         embedder=GeminiEmbedder(
-            config=GeminiEmbedderConfig(api_key=api_key, embedding_dim=768, embedding_model='gemini-embedding-001')
+            config=GeminiEmbedderConfig(
+                api_key=api_key, embedding_dim=768, embedding_model='gemini-embedding-001'
+            )
         ),
         cross_encoder=GeminiRerankerClient(
             config=LLMConfig(
@@ -282,6 +284,7 @@ async def process_episodes(episodes: list[dict[str, Any]]) -> dict[str, Any]:
         # Close the connection
         await graphiti.close()
         print('\nConnection closed')
+
 
 async def main():
     """

@@ -113,7 +113,56 @@ async def add_nodes_and_edges_bulk(
     entity_nodes: list[EntityNode],
     entity_edges: list[EntityEdge],
     embedder: EmbedderClient,
+    use_batch_write: bool | None = None,
 ):
+    """Add nodes and edges to the graph in bulk.
+
+    For Spanner, this supports two modes:
+
+    1. Transaction mode (use_batch_write=False):
+       - Uses read-write transactions with retry logic
+       - May encounter 409 ABORTED errors under high parallelism
+       - Atomic: all mutations succeed or all fail
+
+    2. BatchWrite mode (use_batch_write=True, default for Spanner):
+       - Uses blind writes without transactions
+       - Zero lock conflicts, linear scalability
+       - Each mutation is atomic, but mutations are independent
+       - Last-write-wins semantics (safe for upserts)
+
+    Args:
+        driver: The graph driver
+        episodic_nodes: Episode nodes to insert
+        episodic_edges: Episodic edges to insert
+        entity_nodes: Entity nodes to insert
+        entity_edges: Entity edges to insert
+        embedder: Embedder client for generating embeddings
+        use_batch_write: For Spanner only. If True, use BatchWrite API for
+            conflict-free parallel writes. If False, use transactions.
+            If None (default), uses SPANNER_BATCH_WRITE_CONFIG['enabled'].
+    """
+    # Check if we should use BatchWrite for Spanner
+    if driver.provider == GraphProvider.SPANNER:
+        from graphiti_core.driver.spanner_driver import SPANNER_BATCH_WRITE_CONFIG
+
+        # Determine whether to use batch write
+        should_use_batch_write = use_batch_write
+        if should_use_batch_write is None:
+            should_use_batch_write = SPANNER_BATCH_WRITE_CONFIG.get('enabled', True)
+
+        if should_use_batch_write:
+            # Use BatchWrite mode - conflict-free blind writes
+            await _add_nodes_and_edges_bulk_batch_write(
+                driver,
+                episodic_nodes,
+                episodic_edges,
+                entity_nodes,
+                entity_edges,
+                embedder,
+            )
+            return
+
+    # Default: use transaction mode
     session = driver.session()
     try:
         await session.execute_write(
@@ -125,6 +174,269 @@ async def add_nodes_and_edges_bulk(
             embedder,
             driver=driver,
         )
+    finally:
+        await session.close()
+
+
+async def _add_nodes_and_edges_bulk_batch_write(
+    driver: GraphDriver,
+    episodic_nodes: list[EpisodicNode],
+    episodic_edges: list[EpisodicEdge],
+    entity_nodes: list[EntityNode],
+    entity_edges: list[EntityEdge],
+    embedder: EmbedderClient,
+):
+    """Spanner-specific: Add nodes and edges using BatchWrite API for conflict-free writes.
+
+    This function uses Spanner's BatchWrite API which performs blind writes:
+    - No read phase = no shared locks
+    - No lock upgrade = no deadlock detection
+    - Mutations are applied directly = no 409 ABORTED errors
+
+    This is ideal for parallel batch processing where multiple workers may
+    write to overlapping data (e.g., same entities discovered in different episodes).
+
+    Trade-offs:
+    - PRO: Zero lock contention, linear scalability with parallelism
+    - CON: Last-write-wins semantics, each mutation atomic but not across mutations
+    """
+    from time import time
+
+    from graphiti_core.driver.spanner_driver import SPANNER_BATCH_WRITE_CONFIG
+
+    logger.info(
+        f'[BATCH_WRITE] Starting batch write: {len(episodic_nodes)} episodes, '
+        f'{len(entity_nodes)} nodes, {len(entity_edges)} edges, {len(episodic_edges)} episodic edges'
+    )
+
+    total_start = time()
+
+    # Step 1: Generate embeddings in parallel (same as transaction mode)
+    embed_start = time()
+
+    nodes_needing_embeddings = [node for node in entity_nodes if node.name_embedding is None]
+    if nodes_needing_embeddings:
+        await semaphore_gather(
+            *[node.generate_name_embedding(embedder) for node in nodes_needing_embeddings]
+        )
+
+    edges_needing_embeddings = [edge for edge in entity_edges if edge.fact_embedding is None]
+    if edges_needing_embeddings:
+        await semaphore_gather(
+            *[edge.generate_embedding(embedder) for edge in edges_needing_embeddings]
+        )
+
+    embed_time = (time() - embed_start) * 1000
+    logger.debug(
+        f'[BATCH_WRITE] Embedding generation: {embed_time:.2f}ms '
+        f'({len(nodes_needing_embeddings)} nodes + {len(edges_needing_embeddings)} edges)'
+    )
+
+    # Step 2: Prepare data for mutations
+    prep_start = time()
+
+    episodes = [dict(episode) for episode in episodic_nodes]
+    for episode in episodes:
+        episode['source'] = str(episode['source'].value)
+        episode.pop('labels', None)
+
+    nodes = []
+    for node in entity_nodes:
+        entity_data: dict[str, Any] = {
+            'uuid': node.uuid,
+            'name': node.name,
+            'group_id': node.group_id,
+            'summary': node.summary,
+            'created_at': node.created_at,
+        }
+        if not bool(driver.aoss_client):
+            entity_data['name_embedding'] = node.name_embedding
+        entity_data['labels'] = list(set(node.labels + ['Entity']))
+        attributes = convert_datetimes_to_strings(node.attributes) if node.attributes else {}
+        entity_data['attributes'] = json.dumps(attributes)
+        nodes.append(entity_data)
+
+    edges = []
+    for edge in entity_edges:
+        edge_data: dict[str, Any] = {
+            'uuid': edge.uuid,
+            'source_node_uuid': edge.source_node_uuid,
+            'target_node_uuid': edge.target_node_uuid,
+            'name': edge.name,
+            'fact': edge.fact,
+            'group_id': edge.group_id,
+            'episodes': edge.episodes,
+            'created_at': edge.created_at,
+            'expired_at': edge.expired_at,
+            'valid_at': edge.valid_at if edge.valid_at else edge.created_at,
+            'invalid_at': edge.invalid_at,
+        }
+        if not bool(driver.aoss_client):
+            edge_data['fact_embedding'] = edge.fact_embedding
+        attributes = convert_datetimes_to_strings(edge.attributes) if edge.attributes else {}
+        edge_data['attributes'] = json.dumps(attributes)
+        edges.append(edge_data)
+
+    prep_time = (time() - prep_start) * 1000
+    logger.debug(f'[BATCH_WRITE] Data preparation: {prep_time:.2f}ms')
+
+    # Step 3: Build mutations list
+    mutations_start = time()
+    mutations = []
+
+    # Episodic nodes
+    if episodes:
+        episode_columns = [
+            'source',
+            'source_description',
+            'content',
+            'entity_edges',
+            'uuid',
+            'name',
+            'group_id',
+            'created_at',
+            'valid_at',
+        ]
+        for episode in episodes:
+            mutations.append(
+                {
+                    'table': 'EpisodicNode',
+                    'columns': episode_columns,
+                    'values': [
+                        episode['source'],
+                        episode.get('source_description', ''),
+                        episode.get('content', ''),
+                        episode.get('entity_edges', []),
+                        episode['uuid'],
+                        episode['name'],
+                        episode['group_id'],
+                        episode['created_at'],
+                        episode['valid_at'],
+                    ],
+                }
+            )
+
+    # Entity nodes
+    if nodes:
+        node_columns = [
+            'uuid',
+            'name',
+            'group_id',
+            'labels',
+            'created_at',
+            'name_embedding',
+            'summary',
+            'attributes',
+        ]
+        for node in nodes:
+            mutations.append(
+                {
+                    'table': 'EntityNode',
+                    'columns': node_columns,
+                    'values': [
+                        node['uuid'],
+                        node['name'],
+                        node['group_id'],
+                        node.get('labels', []),
+                        node['created_at'],
+                        node.get('name_embedding', []),
+                        node.get('summary', ''),
+                        node.get('attributes', '{}'),
+                    ],
+                }
+            )
+
+    # Entity edges
+    if edges:
+        edge_columns = [
+            'uuid',
+            'source_node_uuid',
+            'target_node_uuid',
+            'name',
+            'fact',
+            'group_id',
+            'episodes',
+            'created_at',
+            'expired_at',
+            'valid_at',
+            'invalid_at',
+            'fact_embedding',
+            'attributes',
+            'labels',
+        ]
+        for edge in edges:
+            mutations.append(
+                {
+                    'table': 'EntityEdge',
+                    'columns': edge_columns,
+                    'values': [
+                        edge['uuid'],
+                        edge['source_node_uuid'],
+                        edge['target_node_uuid'],
+                        edge['name'],
+                        edge['fact'],
+                        edge['group_id'],
+                        edge.get('episodes', []),
+                        edge['created_at'],
+                        edge.get('expired_at'),
+                        edge.get('valid_at'),
+                        edge.get('invalid_at'),
+                        edge.get('fact_embedding', []),
+                        edge.get('attributes', '{}'),
+                        edge.get('labels', []),
+                    ],
+                }
+            )
+
+    # Episodic edges
+    if episodic_edges:
+        episodic_edge_columns = [
+            'uuid',
+            'source_node_uuid',
+            'target_node_uuid',
+            'group_id',
+            'created_at',
+        ]
+        for edge in episodic_edges:
+            edge_dict = edge.model_dump()
+            mutations.append(
+                {
+                    'table': 'EpisodicEdge',
+                    'columns': episodic_edge_columns,
+                    'values': [
+                        edge_dict['uuid'],
+                        edge_dict['source_node_uuid'],
+                        edge_dict['target_node_uuid'],
+                        edge_dict['group_id'],
+                        edge_dict['created_at'],
+                    ],
+                }
+            )
+
+    mutations_time = (time() - mutations_start) * 1000
+    logger.debug(
+        f'[BATCH_WRITE] Mutation building: {mutations_time:.2f}ms ({len(mutations)} mutations)'
+    )
+
+    # Step 4: Execute BatchWrite
+    session = driver.session()
+    try:
+        mutations_per_group = SPANNER_BATCH_WRITE_CONFIG.get('mutations_per_group', 1)
+
+        successful, failed = await session.run_mutations_batch_write(  # type: ignore[attr-defined]
+            mutations,
+            mutations_per_group=mutations_per_group,
+        )
+
+        total_time = (time() - total_start) * 1000
+        logger.info(
+            f'[BATCH_WRITE] Completed in {total_time:.2f}ms: '
+            f'{successful} successful, {failed} failed mutations'
+        )
+
+        if failed > 0:
+            logger.warning(f'[BATCH_WRITE] {failed} mutations failed during batch write')
+
     finally:
         await session.close()
 
@@ -141,31 +453,31 @@ async def add_nodes_and_edges_bulk_tx(
     from time import time
 
     step_start = time()
-    
+
     # OPTIMIZATION 1: Batch generate embeddings in parallel before data prep
     # This is much faster than sequential generation
     embed_start = time()
-    
+
     # Find nodes without embeddings and generate in parallel
     nodes_needing_embeddings = [node for node in entity_nodes if node.name_embedding is None]
     if nodes_needing_embeddings:
         await semaphore_gather(
             *[node.generate_name_embedding(embedder) for node in nodes_needing_embeddings]
         )
-    
+
     # Find edges without embeddings and generate in parallel
     edges_needing_embeddings = [edge for edge in entity_edges if edge.fact_embedding is None]
     if edges_needing_embeddings:
         await semaphore_gather(
             *[edge.generate_embedding(embedder) for edge in edges_needing_embeddings]
         )
-    
+
     embed_time = (time() - embed_start) * 1000
-    logger.debug(f'[PROFILING] Parallel embedding generation: {embed_time:.2f}ms ({len(nodes_needing_embeddings)} nodes + {len(edges_needing_embeddings)} edges)')
-    
+    logger.debug(
+        f'[PROFILING] Parallel embedding generation: {embed_time:.2f}ms ({len(nodes_needing_embeddings)} nodes + {len(edges_needing_embeddings)} edges)'
+    )
+
     # OPTIMIZATION 2: Prepare data outside transaction for faster commit
-    prep_start = time()
-    
     episodes = [dict(episode) for episode in episodic_nodes]
     for episode in episodes:
         episode['source'] = str(episode['source'].value)
@@ -219,12 +531,11 @@ async def add_nodes_and_edges_bulk_tx(
             edge_data['attributes'] = json.dumps(attributes)
 
             # Spanner-specific handling for optional timestamp fields
-            if driver.provider == GraphProvider.SPANNER:
-                # Keep expired_at and invalid_at as NULL (None) by default
-                # Only set valid_at to creation time if it's None
-                if edge_data['valid_at'] is None:
-                    edge_data['valid_at'] = edge.created_at  # Default to creation time
-                # expired_at and invalid_at remain None (NULL in database)
+            # Keep expired_at and invalid_at as NULL (None) by default
+            # Only set valid_at to creation time if it's None
+            if driver.provider == GraphProvider.SPANNER and edge_data['valid_at'] is None:
+                edge_data['valid_at'] = edge.created_at  # Default to creation time
+            # expired_at and invalid_at remain None (NULL in database)
         else:
             edge_data.update(edge.attributes or {})
 
@@ -249,11 +560,20 @@ async def add_nodes_and_edges_bulk_tx(
 
             # Build mutations list
             mutations = []
-            
+
             # Add episode inserts as mutations
             if episodes:
-                episode_columns = ['source', 'source_description', 'content', 'entity_edges', 
-                                  'uuid', 'name', 'group_id', 'created_at', 'valid_at']
+                episode_columns = [
+                    'source',
+                    'source_description',
+                    'content',
+                    'entity_edges',
+                    'uuid',
+                    'name',
+                    'group_id',
+                    'created_at',
+                    'valid_at',
+                ]
                 for episode in episodes:
                     mutation_data = {
                         'table': 'EpisodicNode',
@@ -268,14 +588,22 @@ async def add_nodes_and_edges_bulk_tx(
                             episode['group_id'],
                             episode['created_at'],
                             episode['valid_at'],
-                        ]
+                        ],
                     }
                     mutations.append(mutation_data)
 
             # Add entity node inserts as mutations
             if nodes:
-                node_columns = ['uuid', 'name', 'group_id', 'labels', 'created_at', 
-                               'name_embedding', 'summary', 'attributes']
+                node_columns = [
+                    'uuid',
+                    'name',
+                    'group_id',
+                    'labels',
+                    'created_at',
+                    'name_embedding',
+                    'summary',
+                    'attributes',
+                ]
                 for node in nodes:
                     mutation_data = {
                         'table': 'EntityNode',
@@ -289,15 +617,28 @@ async def add_nodes_and_edges_bulk_tx(
                             node.get('name_embedding', []),
                             node.get('summary', ''),
                             node.get('attributes', '{}'),
-                        ]
+                        ],
                     }
                     mutations.append(mutation_data)
 
             # Add entity edge inserts as mutations
             if edges:
-                edge_columns = ['uuid', 'source_node_uuid', 'target_node_uuid', 'name', 'fact',
-                               'group_id', 'episodes', 'created_at', 'expired_at', 'valid_at', 
-                               'invalid_at', 'fact_embedding', 'attributes', 'labels']
+                edge_columns = [
+                    'uuid',
+                    'source_node_uuid',
+                    'target_node_uuid',
+                    'name',
+                    'fact',
+                    'group_id',
+                    'episodes',
+                    'created_at',
+                    'expired_at',
+                    'valid_at',
+                    'invalid_at',
+                    'fact_embedding',
+                    'attributes',
+                    'labels',
+                ]
                 for edge in edges:
                     mutation_data = {
                         'table': 'EntityEdge',
@@ -317,15 +658,20 @@ async def add_nodes_and_edges_bulk_tx(
                             edge.get('fact_embedding', []),
                             edge.get('attributes', '{}'),
                             edge.get('labels', []),
-                        ]
+                        ],
                     }
                     mutations.append(mutation_data)
 
             # Add episodic edge inserts as mutations
             if episodic_edges:
                 # Note: EpisodicEdge model doesn't have 'name' field, only base fields
-                episodic_edge_columns = ['uuid', 'source_node_uuid', 'target_node_uuid', 
-                                        'group_id', 'created_at']
+                episodic_edge_columns = [
+                    'uuid',
+                    'source_node_uuid',
+                    'target_node_uuid',
+                    'group_id',
+                    'created_at',
+                ]
                 for edge in episodic_edges:
                     edge_dict = edge.model_dump()
                     mutation_data = {
@@ -337,7 +683,7 @@ async def add_nodes_and_edges_bulk_tx(
                             edge_dict['target_node_uuid'],
                             edge_dict['group_id'],
                             edge_dict['created_at'],
-                        ]
+                        ],
                     }
                     mutations.append(mutation_data)
 

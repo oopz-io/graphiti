@@ -331,16 +331,16 @@ async def resolve_extracted_nodes(
 ) -> tuple[list[EntityNode], dict[str, str], list[tuple[EntityNode, EntityNode]]]:
     """Search for existing nodes, resolve deterministic matches, then escalate holdouts to the LLM dedupe prompt."""
     from time import time
-    
+
     start_total = time()
     step_start = time()
-    
+
     # Initialize profiling data for this function
     _profiling_data['resolve_extracted_nodes'] = {}
-    
+
     llm_client = clients.llm_client
     driver = clients.driver
-    
+
     # Step 1: Collect candidate nodes
     existing_nodes = await _collect_candidate_nodes(
         clients,
@@ -349,7 +349,9 @@ async def resolve_extracted_nodes(
     )
     collect_time = (time() - step_start) * 1000
     _profiling_data['resolve_extracted_nodes']['collect_candidates'] = collect_time
-    logger.debug(f'[PROFILING] resolve_extracted_nodes - Collect candidates: {collect_time:.2f}ms ({len(existing_nodes)} nodes)')
+    logger.debug(
+        f'[PROFILING] resolve_extracted_nodes - Collect candidates: {collect_time:.2f}ms ({len(existing_nodes)} nodes)'
+    )
     step_start = time()
 
     # Step 2: Build candidate indexes
@@ -370,7 +372,9 @@ async def resolve_extracted_nodes(
     _resolve_with_similarity(extracted_nodes, indexes, state)
     similarity_time = (time() - step_start) * 1000
     _profiling_data['resolve_extracted_nodes']['resolve_similarity'] = similarity_time
-    logger.debug(f'[PROFILING] resolve_extracted_nodes - Resolve with similarity: {similarity_time:.2f}ms')
+    logger.debug(
+        f'[PROFILING] resolve_extracted_nodes - Resolve with similarity: {similarity_time:.2f}ms'
+    )
     step_start = time()
 
     # Step 4: Resolve with LLM
@@ -406,7 +410,7 @@ async def resolve_extracted_nodes(
     filter_time = (time() - step_start) * 1000
     _profiling_data['resolve_extracted_nodes']['filter_duplicates'] = filter_time
     logger.debug(f'[PROFILING] resolve_extracted_nodes - Filter duplicates: {filter_time:.2f}ms')
-    
+
     total_time = (time() - start_total) * 1000
     _profiling_data['resolve_extracted_nodes']['total'] = total_time
     logger.debug(f'[PROFILING] resolve_extracted_nodes - TOTAL: {total_time:.2f}ms')
@@ -427,13 +431,13 @@ async def extract_attributes_from_nodes(
     generate_summaries: bool = True,
 ) -> list[EntityNode]:
     from time import time
-    
+
     start_total = time()
     step_start = time()
-    
+
     # Initialize profiling data for this function
     _profiling_data['extract_attributes_from_nodes'] = {}
-    
+
     llm_client = clients.llm_client
     embedder = clients.embedder
     updated_nodes: list[EntityNode] = await semaphore_gather(
@@ -454,18 +458,22 @@ async def extract_attributes_from_nodes(
             for node in nodes
         ]
     )
-    
+
     extract_time = (time() - step_start) * 1000
     _profiling_data['extract_attributes_from_nodes']['extract_attributes_llm'] = extract_time
-    logger.debug(f'[PROFILING] extract_attributes_from_nodes - Extract attributes (LLM): {extract_time:.2f}ms ({len(nodes)} nodes)')
+    logger.debug(
+        f'[PROFILING] extract_attributes_from_nodes - Extract attributes (LLM): {extract_time:.2f}ms ({len(nodes)} nodes)'
+    )
     step_start = time()
 
     await create_entity_node_embeddings(embedder, updated_nodes)
-    
+
     embed_time = (time() - step_start) * 1000
     _profiling_data['extract_attributes_from_nodes']['create_embeddings'] = embed_time
-    logger.debug(f'[PROFILING] extract_attributes_from_nodes - Create embeddings: {embed_time:.2f}ms')
-    
+    logger.debug(
+        f'[PROFILING] extract_attributes_from_nodes - Create embeddings: {embed_time:.2f}ms'
+    )
+
     total_time = (time() - start_total) * 1000
     _profiling_data['extract_attributes_from_nodes']['total'] = total_time
     logger.debug(f'[PROFILING] extract_attributes_from_nodes - TOTAL: {total_time:.2f}ms')

@@ -15,9 +15,9 @@ limitations under the License.
 """
 
 from graphiti_core.utils.contradicted_edges_utils import (
-    get_invalidating_edges_by_invalidated_uuids,
     get_all_contradictions_for_group,
     get_contradiction_details,
+    get_invalidating_edges_by_invalidated_uuids,
 )
 
 __all__ = [

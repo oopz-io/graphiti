@@ -227,21 +227,21 @@ class GeminiClient(LLMClient):
                     schema.update(sanitized)
                     del schema['anyOf']
                     # schema['nullable'] = True # Vertex might not support this directly in all versions
-            
+
         # Recursively sanitize properties
         if 'properties' in schema:
             for prop in schema['properties'].values():
                 self._sanitize_schema(prop)
-        
+
         # Recursively sanitize items
         if 'items' in schema:
             self._sanitize_schema(schema['items'])
-            
+
         # Recursively sanitize definitions
         if '$defs' in schema:
             for def_schema in schema['$defs'].values():
                 self._sanitize_schema(def_schema)
-                
+
         return schema
 
     def salvage_json(self, raw_output: str) -> dict[str, typing.Any] | None:
@@ -308,7 +308,7 @@ class GeminiClient(LLMClient):
             if response_model is not None:
                 # Get the schema from the Pydantic model
                 pydantic_schema = response_model.model_json_schema()
-                
+
                 # Sanitize schema for Vertex AI compatibility
                 sanitized_schema = self._sanitize_schema(pydantic_schema)
 

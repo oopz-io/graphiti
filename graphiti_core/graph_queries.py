@@ -117,11 +117,10 @@ def get_fulltext_indices(provider: GraphProvider) -> list[LiteralString]:
             "CALL CREATE_FTS_INDEX('Community', 'community_name', ['name']);",
             "CALL CREATE_FTS_INDEX('RelatesToNode_', 'edge_name_and_fact', ['name', 'fact']);",
         ]
-    
+
     if provider == GraphProvider.SPANNER:
         # indexes are created during schema setup
         return []
-
 
     return [
         """CREATE FULLTEXT INDEX episode_content IF NOT EXISTS
@@ -143,12 +142,12 @@ def get_nodes_query(name: str, query: str, limit: int, provider: GraphProvider) 
     if provider == GraphProvider.KUZU:
         label = INDEX_TO_LABEL_KUZU_MAPPING[name]
         return f"CALL QUERY_FTS_INDEX('{label}', '{name}', {query}, TOP := $limit)"
-    
+
     if provider == GraphProvider.SPANNER:
         # Spanner uses direct SQL with SEARCH function
         # This is handled in the search_utils.py node_fulltext_search function
         # Return empty string as the query is built differently for Spanner
-        return ""
+        return ''
 
     return f'CALL db.index.fulltext.queryNodes("{name}", {query}, {{limit: $limit}})'
 
@@ -175,6 +174,6 @@ def get_relationships_query(name: str, limit: int, provider: GraphProvider) -> s
 
     if provider == GraphProvider.SPANNER:
         # Spanner uses direct SELECT with SEARCH on tokenlist columns
-        return ""  # Query is constructed directly in edge_fulltext_search
+        return ''  # Query is constructed directly in edge_fulltext_search
 
     return f'CALL db.index.fulltext.queryRelationships("{name}", $query, {{limit: $limit}})'

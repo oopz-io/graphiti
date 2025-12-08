@@ -292,25 +292,27 @@ async def edge_fulltext_search(
     elif driver.provider == GraphProvider.SPANNER:
         # Spanner full-text search for edges using SEARCH on tokenlist columns
         filter_conditions = []
-        
+
         # Build the WHERE clause with proper group_ids handling
         if group_ids:
             group_id_list = ', '.join([f"'{gid}'" for gid in group_ids])
             filter_conditions.append(f'group_id IN ({group_id_list})')
-        
+
         # Add label filtering if specified (will be applied in outer query)
         if search_filter.node_labels:
-            label_filter = 'EXISTS (SELECT 1 FROM EntityNode AS node WHERE node.uuid = source_node_uuid AND ('
+            label_filter = (
+                'EXISTS (SELECT 1 FROM EntityNode AS node WHERE node.uuid = source_node_uuid AND ('
+            )
             label_conditions = []
             for label in search_filter.node_labels:
                 label_conditions.append(f"'{label}' IN UNNEST(node.labels)")
             label_filter += ' OR '.join(label_conditions) + '))'
             filter_conditions.append(label_filter)
-        
+
         outer_where = ''
         if filter_conditions:
             outer_where = 'WHERE ' + ' AND '.join(filter_conditions)
-        
+
         # Use subquery to keep SEARCH in proper query shape for search index
         inner_limit = limit * 2  # Pre-calculate since Spanner doesn't support expressions in LIMIT
         spanner_query = f"""
@@ -329,7 +331,7 @@ async def edge_fulltext_search(
             ORDER BY e.score DESC, e.uuid
             LIMIT @limit
         """
-        
+
         records, _, _ = await driver.execute_query(
             spanner_query,
             query=fuzzy_query,
@@ -506,29 +508,34 @@ async def edge_similarity_search(
         label_filter = ''
         if search_filter.node_labels:
             # Add label filtering by joining with EntityNode table
-            label_filter = ' AND EXISTS (SELECT 1 FROM EntityNode AS n WHERE n.uuid = e.source_node_uuid AND ('
+            label_filter = (
+                ' AND EXISTS (SELECT 1 FROM EntityNode AS n WHERE n.uuid = e.source_node_uuid AND ('
+            )
             label_conditions = []
             for label in search_filter.node_labels:
                 label_conditions.append(f"'{label}' IN UNNEST(n.labels)")
             label_filter += ' OR '.join(label_conditions) + '))'
-            
+
         if filter_query:
             filter_query = filter_query.replace('WHERE', 'AND')
             # Replace $ with @ and handle IN clauses with UNNEST
             import re
+
             # Match patterns like "IN $param" and replace with "IN UNNEST(@param)" (case-insensitive)
-            filter_query = re.sub(r'\bIN\s+\$(\w+)', r'IN UNNEST(@\1)', filter_query, flags=re.IGNORECASE)
+            filter_query = re.sub(
+                r'\bIN\s+\$(\w+)', r'IN UNNEST(@\1)', filter_query, flags=re.IGNORECASE
+            )
             filter_query = re.sub(r'\bin\s+\$(\w+)', r'IN UNNEST(@\1)', filter_query)
             # Replace any remaining $ with @
             filter_query = filter_query.replace('$', '@')
         else:
             filter_query = ''
-        
+
         # Spanner's COSINE_DISTANCE returns DISTANCE (0 = identical, higher = more different)
         # Convert to similarity: similarity = 1 - distance
         # Filter by similarity > min_score, which means distance < (1 - min_score)
         max_distance = 1.0 - min_score
-        
+
         query = f"""
             WITH cosine_distance AS (
                 SELECT id, COSINE_DISTANCE(fact_embedding, @search_vector) as distance 
@@ -550,7 +557,7 @@ async def edge_similarity_search(
             ORDER BY c.distance ASC
             LIMIT @limit
         """
-        
+
         records, _, _ = await driver.execute_query(
             query,
             search_vector=search_vector,
@@ -622,16 +629,19 @@ async def edge_bfs_search(
             filter_query_spanner = filter_query.replace('$', '@')
             # Handle IN clauses with UNNEST
             import re
-            filter_query_spanner = re.sub(r'\bIN\s+@(\w+)', r'IN UNNEST(@\1)', filter_query_spanner, flags=re.IGNORECASE)
+
+            filter_query_spanner = re.sub(
+                r'\bIN\s+@(\w+)', r'IN UNNEST(@\1)', filter_query_spanner, flags=re.IGNORECASE
+            )
         else:
             filter_query_spanner = ''
-        
+
         # Build GQL query for edge BFS using quantified path patterns
         origin_uuids = ', '.join([f"'{uuid}'" for uuid in bfs_origin_node_uuids])
-        
+
         # For edges, we traverse 0 to (depth-1) hops, then match the edge as the last hop
         max_hops_before_edge = max(0, bfs_max_depth - 1)
-        
+
         spanner_query = f"""
             GRAPH GRAPHITI
             MATCH (origin)-[:RELATES_TO]->{{0,{max_hops_before_edge}}}()-[e:RELATES_TO]->()
@@ -643,14 +653,14 @@ async def edge_bfs_search(
                    e.invalid_at AS invalid_at, e.attributes AS attributes
             LIMIT @limit
         """
-        
+
         records, _, _ = await driver.execute_query(
             spanner_query,
             limit=limit,
             routing_='r',
             **filter_params,
         )
-        
+
         edges = [get_entity_edge_from_record(record, driver.provider) for record in records]
         return edges
 
@@ -853,23 +863,25 @@ async def node_fulltext_search(
         # Spanner uses SEARCH function for full-text search
         # Build filter conditions for the outer WHERE clause
         filter_conditions = []
-        
+
         if group_ids is not None:
             group_id_list = ', '.join([f"'{gid}'" for gid in group_ids])
             filter_conditions.append(f'group_id IN ({group_id_list})')
-        
+
         # Add search filters (node_labels, date filters, etc.)
-        if (search_filter.node_labels or search_filter.created_at or 
-            search_filter.valid_at or search_filter.invalid_at):
-            filter_queries, _ = node_search_filter_query_constructor(
-                search_filter, driver.provider
-            )
+        if (
+            search_filter.node_labels
+            or search_filter.created_at
+            or search_filter.valid_at
+            or search_filter.invalid_at
+        ):
+            filter_queries, _ = node_search_filter_query_constructor(search_filter, driver.provider)
             filter_conditions.extend(filter_queries)
-        
+
         outer_where = ''
         if filter_conditions:
             outer_where = 'WHERE ' + ' AND '.join(filter_conditions)
-        
+
         # Spanner full-text search: Use subquery to first get search results, then filter
         # This ensures SEARCH remains in the correct query shape for the search index
         # Reference: https://cloud.google.com/spanner/docs/full-text-search
@@ -886,7 +898,7 @@ async def node_fulltext_search(
             {outer_where}
             LIMIT @limit
         """
-        
+
         records, _, _ = await driver.execute_query(
             spanner_query,
             query=fuzzy_query,
@@ -1039,18 +1051,21 @@ async def node_similarity_search(
             filter_query = filter_query.replace('WHERE', 'AND')
             # Replace $ with @ and handle IN clauses with UNNEST
             import re
-            filter_query = re.sub(r'\bIN\s+\$(\w+)', r'IN UNNEST(@\1)', filter_query, flags=re.IGNORECASE)
+
+            filter_query = re.sub(
+                r'\bIN\s+\$(\w+)', r'IN UNNEST(@\1)', filter_query, flags=re.IGNORECASE
+            )
             filter_query = filter_query.replace('$', '@')
             # Replace n. with e. since we use e as the alias in this query
             filter_query = filter_query.replace('n.', 'e.')
         else:
             filter_query = ''
-            
+
         # Spanner's COSINE_DISTANCE actually returns DISTANCE (0 = identical, higher = more different)
         # This is opposite to cosine similarity. We need to convert: similarity = 1 - distance
         # Then filter by similarity > min_score, which means distance < (1 - min_score)
         max_distance = 1.0 - min_score
-        
+
         query = f"""
             WITH cosine_distance AS (
                 SELECT id, COSINE_DISTANCE(name_embedding, @search_vector) as distance 
@@ -1069,7 +1084,7 @@ async def node_similarity_search(
             ORDER BY c.distance ASC
             LIMIT @limit
         """
-        
+
         records, _, _ = await driver.execute_query(
             query,
             search_vector=search_vector,
@@ -1078,7 +1093,7 @@ async def node_similarity_search(
             routing_='r',
             **filter_params,
         )
-        
+
     else:
         query = (
             """
@@ -1143,13 +1158,16 @@ async def node_bfs_search(
             filter_query_spanner = filter_query.replace('$', '@')
             # Handle IN clauses with UNNEST
             import re
-            filter_query_spanner = re.sub(r'\bIN\s+@(\w+)', r'IN UNNEST(@\1)', filter_query_spanner, flags=re.IGNORECASE)
+
+            filter_query_spanner = re.sub(
+                r'\bIN\s+@(\w+)', r'IN UNNEST(@\1)', filter_query_spanner, flags=re.IGNORECASE
+            )
         else:
             filter_query_spanner = ''
-        
+
         # Build GQL query for node BFS using quantified path patterns
         origin_uuids = ', '.join([f"'{uuid}'" for uuid in bfs_origin_node_uuids])
-        
+
         # GQL query to traverse from origin nodes to connected entity nodes
         spanner_query = f"""
             GRAPH GRAPHITI
@@ -1161,14 +1179,14 @@ async def node_bfs_search(
                    n.summary AS summary, n.labels AS labels, n.attributes AS attributes
             LIMIT @limit
         """
-        
+
         records, _, _ = await driver.execute_query(
             spanner_query,
             limit=limit,
             routing_='r',
             **filter_params,
         )
-        
+
         nodes = [get_entity_node_from_record(record, driver.provider) for record in records]
         return nodes
 
@@ -1409,7 +1427,7 @@ async def community_fulltext_search(
         if group_ids is not None:
             group_id_list = ', '.join([f"'{gid}'" for gid in group_ids])
             group_filter = f' AND c.group_id IN ({group_id_list})'
-        
+
         spanner_query = f"""
             SELECT c.uuid, c.group_id, c.name, c.created_at, c.summary, NULL as name_embedding
             FROM CommunityNode AS c
@@ -1418,14 +1436,14 @@ async def community_fulltext_search(
             ORDER BY c.uuid
             LIMIT @limit
         """
-        
+
         records, _, _ = await driver.execute_query(
             spanner_query,
             query=fuzzy_query,
             limit=limit,
             routing_='r',
         )
-        
+
         communities = [get_community_node_from_record(record) for record in records]
         return communities
     elif driver.provider == GraphProvider.NEPTUNE:
@@ -1508,13 +1526,13 @@ async def community_similarity_search(
         # Convert to similarity: similarity = 1 - distance
         # Filter by similarity > min_score, which means distance < (1 - min_score)
         max_distance = 1.0 - min_score
-        
+
         # Build group filter
         group_filter = ''
         if group_ids is not None:
             group_id_list = ', '.join([f"'{gid}'" for gid in group_ids])
             group_filter = f'AND c.group_id IN ({group_id_list})'
-        
+
         query = f"""
             WITH cosine_distance AS (
                 SELECT id, COSINE_DISTANCE(name_embedding, @search_vector) as distance 
@@ -1534,7 +1552,7 @@ async def community_similarity_search(
             ORDER BY d.distance ASC
             LIMIT @limit
         """
-        
+
         records, _, _ = await driver.execute_query(
             query,
             search_vector=search_vector,

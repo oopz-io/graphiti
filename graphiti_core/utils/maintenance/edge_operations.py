@@ -108,7 +108,7 @@ async def extract_edges(
 ) -> list[EntityEdge]:
     start_total = time()
     step_start = time()
-    
+
     # Initialize profiling data for this function
     _profiling_data['extract_edges'] = {}
 
@@ -147,7 +147,7 @@ async def extract_edges(
         'custom_prompt': '',
         'ensure_ascii': clients.ensure_ascii,
     }
-    
+
     prep_time = (time() - step_start) * 1000
     _profiling_data['extract_edges']['context_prep'] = prep_time
     logger.debug(f'[PROFILING] extract_edges - Context preparation: {prep_time:.2f}ms')
@@ -157,7 +157,7 @@ async def extract_edges(
     reflexion_iterations = 0
     llm_calls = 0
     llm_total_time = 0.0
-    
+
     while facts_missed and reflexion_iterations <= MAX_REFLEXION_ITERATIONS:
         llm_call_start = time()
         llm_response = await llm_client.generate_response(
@@ -169,7 +169,7 @@ async def extract_edges(
         llm_total_time += llm_call_time
         llm_calls += 1
         logger.debug(f'[PROFILING] extract_edges - LLM call #{llm_calls}: {llm_call_time:.2f}ms')
-        
+
         edges_data = ExtractedEdges(**llm_response).edges
 
         context['extracted_facts'] = [edge_data.fact for edge_data in edges_data]
@@ -191,10 +191,12 @@ async def extract_edges(
             context['custom_prompt'] = custom_prompt
 
             facts_missed = len(missing_facts) != 0
-    
+
     _profiling_data['extract_edges']['llm_calls'] = llm_calls
     _profiling_data['extract_edges']['llm_total_time'] = llm_total_time
-    logger.debug(f'[PROFILING] extract_edges - Total LLM time ({llm_calls} calls): {llm_total_time:.2f}ms')
+    logger.debug(
+        f'[PROFILING] extract_edges - Total LLM time ({llm_calls} calls): {llm_total_time:.2f}ms'
+    )
     step_start = time()
 
     end = time()
@@ -255,11 +257,13 @@ async def extract_edges(
         logger.debug(
             f'Created new edge: {edge.name} from (UUID: {edge.source_node_uuid}) to (UUID: {edge.target_node_uuid})'
         )
-    
+
     edge_creation_time = (time() - step_start) * 1000
     _profiling_data['extract_edges']['edge_creation'] = edge_creation_time
-    logger.debug(f'[PROFILING] extract_edges - Edge object creation: {edge_creation_time:.2f}ms ({len(edges)} edges)')
-    
+    logger.debug(
+        f'[PROFILING] extract_edges - Edge object creation: {edge_creation_time:.2f}ms ({len(edges)} edges)'
+    )
+
     total_time = (time() - start_total) * 1000
     _profiling_data['extract_edges']['total'] = total_time
     logger.debug(f'[PROFILING] extract_edges - TOTAL: {total_time:.2f}ms')
@@ -279,17 +283,17 @@ async def resolve_extracted_edges(
     save_contradicted_edges: bool = False,
 ) -> tuple[list[EntityEdge], list[EntityEdge]]:
     from time import time
-    
+
     start_total = time()
     step_start = time()
-    
+
     # Initialize profiling data for this function
     _profiling_data['resolve_extracted_edges'] = {}
-    
+
     driver = clients.driver
     llm_client = clients.llm_client
     embedder = clients.embedder
-    
+
     await create_entity_edge_embeddings(embedder, extracted_edges)
     embed_time = (time() - step_start) * 1000
     _profiling_data['resolve_extracted_edges']['create_embeddings'] = embed_time
@@ -304,7 +308,9 @@ async def resolve_extracted_edges(
     )
     get_edges_time = (time() - step_start) * 1000
     _profiling_data['resolve_extracted_edges']['get_existing_edges'] = get_edges_time
-    logger.debug(f'[PROFILING] resolve_extracted_edges - Get existing edges: {get_edges_time:.2f}ms')
+    logger.debug(
+        f'[PROFILING] resolve_extracted_edges - Get existing edges: {get_edges_time:.2f}ms'
+    )
     step_start = time()
 
     related_edges_results: list[SearchResults] = await semaphore_gather(
@@ -321,7 +327,9 @@ async def resolve_extracted_edges(
     )
     search_related_time = (time() - step_start) * 1000
     _profiling_data['resolve_extracted_edges']['search_related_edges'] = search_related_time
-    logger.debug(f'[PROFILING] resolve_extracted_edges - Search related edges: {search_related_time:.2f}ms')
+    logger.debug(
+        f'[PROFILING] resolve_extracted_edges - Search related edges: {search_related_time:.2f}ms'
+    )
     step_start = time()
 
     related_edges_lists: list[list[EntityEdge]] = [result.edges for result in related_edges_results]
@@ -339,8 +347,12 @@ async def resolve_extracted_edges(
         ]
     )
     search_invalidation_time = (time() - step_start) * 1000
-    _profiling_data['resolve_extracted_edges']['search_invalidation_candidates'] = search_invalidation_time
-    logger.debug(f'[PROFILING] resolve_extracted_edges - Search invalidation candidates: {search_invalidation_time:.2f}ms')
+    _profiling_data['resolve_extracted_edges']['search_invalidation_candidates'] = (
+        search_invalidation_time
+    )
+    logger.debug(
+        f'[PROFILING] resolve_extracted_edges - Search invalidation candidates: {search_invalidation_time:.2f}ms'
+    )
     step_start = time()
 
     edge_invalidation_candidates: list[list[EntityEdge]] = [
@@ -382,7 +394,7 @@ async def resolve_extracted_edges(
                 extracted_edge_types[type_name] = type_model
 
         edge_types_lst.append(extracted_edge_types)
-    
+
     prep_time = (time() - step_start) * 1000
     _profiling_data['resolve_extracted_edges']['prepare_edge_types'] = prep_time
     logger.debug(f'[PROFILING] resolve_extracted_edges - Prepare edge types: {prep_time:.2f}ms')
@@ -411,33 +423,35 @@ async def resolve_extracted_edges(
             ]
         )
     )
-    
+
     resolve_time = (time() - step_start) * 1000
     _profiling_data['resolve_extracted_edges']['resolve_individual_edges'] = resolve_time
-    logger.debug(f'[PROFILING] resolve_extracted_edges - Resolve individual edges (LLM): {resolve_time:.2f}ms')
+    logger.debug(
+        f'[PROFILING] resolve_extracted_edges - Resolve individual edges (LLM): {resolve_time:.2f}ms'
+    )
     step_start = time()
 
     resolved_edges: list[EntityEdge] = []
     invalidated_edges: list[EntityEdge] = []
     contradicted_edge_pairs: list[tuple[EntityEdge, EntityEdge]] = []  # (invalidated, invalidating)
-    
+
     for result in results:
         resolved_edge = result[0]
         invalidated_edge_chunk = result[1]
 
         resolved_edges.append(resolved_edge)
         invalidated_edges.extend(invalidated_edge_chunk)
-        
+
         # Track which edges were invalidated by this resolved edge
         for invalidated_edge in invalidated_edge_chunk:
             contradicted_edge_pairs.append((invalidated_edge, resolved_edge))
 
     logger.debug(f'Resolved edges: {[(e.name, e.uuid) for e in resolved_edges]}')
-    
+
     # Save contradicted edges to Spanner if enabled
     if save_contradicted_edges and contradicted_edge_pairs:
         from graphiti_core.driver.spanner_driver import SpannerDriver
-        
+
         if isinstance(driver, SpannerDriver):
             try:
                 # Get group_id from the first resolved edge
@@ -446,17 +460,21 @@ async def resolve_extracted_edges(
             except Exception as e:
                 logger.error(f'Failed to save contradicted edges: {e}', exc_info=True)
         else:
-            logger.debug('save_contradicted_edges is enabled but driver is not SpannerDriver, skipping')
+            logger.debug(
+                'save_contradicted_edges is enabled but driver is not SpannerDriver, skipping'
+            )
 
     await semaphore_gather(
         create_entity_edge_embeddings(embedder, resolved_edges),
         create_entity_edge_embeddings(embedder, invalidated_edges),
     )
-    
+
     final_embed_time = (time() - step_start) * 1000
     _profiling_data['resolve_extracted_edges']['final_embeddings'] = final_embed_time
-    logger.debug(f'[PROFILING] resolve_extracted_edges - Final embeddings: {final_embed_time:.2f}ms')
-    
+    logger.debug(
+        f'[PROFILING] resolve_extracted_edges - Final embeddings: {final_embed_time:.2f}ms'
+    )
+
     total_time = (time() - start_total) * 1000
     _profiling_data['resolve_extracted_edges']['total'] = total_time
     logger.debug(f'[PROFILING] resolve_extracted_edges - TOTAL: {total_time:.2f}ms')

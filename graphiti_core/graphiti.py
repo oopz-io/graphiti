@@ -84,8 +84,12 @@ from graphiti_core.utils.maintenance.edge_operations import (
     extract_edges,
     resolve_extracted_edge,
     resolve_extracted_edges,
-    get_profiling_data as get_edge_profiling_data,
+)
+from graphiti_core.utils.maintenance.edge_operations import (
     clear_profiling_data as clear_edge_profiling_data,
+)
+from graphiti_core.utils.maintenance.edge_operations import (
+    get_profiling_data as get_edge_profiling_data,
 )
 from graphiti_core.utils.maintenance.graph_data_operations import (
     EPISODE_WINDOW_LEN,
@@ -93,11 +97,15 @@ from graphiti_core.utils.maintenance.graph_data_operations import (
     retrieve_episodes,
 )
 from graphiti_core.utils.maintenance.node_operations import (
+    clear_profiling_data as clear_node_profiling_data,
+)
+from graphiti_core.utils.maintenance.node_operations import (
     extract_attributes_from_nodes,
     extract_nodes,
     resolve_extracted_nodes,
+)
+from graphiti_core.utils.maintenance.node_operations import (
     get_profiling_data as get_node_profiling_data,
-    clear_profiling_data as clear_node_profiling_data,
 )
 from graphiti_core.utils.ontology_utils.entity_types_utils import validate_entity_types
 
@@ -181,9 +189,9 @@ class Graphiti:
             Set as False to preserve non-ASCII characters (e.g., Korean, Japanese, Chinese) in their
             original form, making them readable in LLM logs and improving model understanding.
         save_contradicted_edges : bool, optional
-            Whether to save contradicted edges to a separate table for audit purposes. 
+            Whether to save contradicted edges to a separate table for audit purposes.
             This is a Spanner-specific feature. Defaults to False.
-            When enabled, edges that are invalidated due to contradictions will be saved to the 
+            When enabled, edges that are invalidated due to contradictions will be saved to the
             ContradictedEdge table with full context about what edge invalidated them and when.
         generate_node_summaries : bool, optional
             Whether to generate and update summaries for EntityNodes using LLM. Defaults to True.
@@ -481,7 +489,7 @@ class Graphiti:
             start = time()
             profile_times: dict[str, float] = {}
             now = utc_now()
-            
+
             # Start timer for validation
             step_start = time()
 
@@ -591,7 +599,12 @@ class Graphiti:
                     self.save_contradicted_edges,
                 ),
                 extract_attributes_from_nodes(
-                    self.clients, nodes, episode, previous_episodes, entity_types, self.generate_node_summaries
+                    self.clients,
+                    nodes,
+                    episode,
+                    previous_episodes,
+                    entity_types,
+                    self.generate_node_summaries,
                 ),
                 max_coroutines=self.max_coroutines,
             )
@@ -648,77 +661,115 @@ class Graphiti:
                 # Retrieve detailed profiling data from sub-operations
                 node_prof = get_node_profiling_data()
                 edge_prof = get_edge_profiling_data()
-                
+
                 logger.info('=' * 80)
                 logger.info(f'add_episode PROFILING for: {name}')
                 logger.info('=' * 80)
                 for step_name, step_time in profile_times.items():
                     percentage = (step_time / total_time) * 100
                     logger.info(f'  {step_name}: {step_time:.2f} ms ({percentage:.1f}%)')
-                    
+
                     # Show detailed breakdown for resolve_extracted_nodes_and_extract_edges
                     if step_name == 'resolve_extracted_nodes_and_extract_edges':
                         logger.info('    │')
                         logger.info('    ├─ resolve_extracted_nodes():')
-                        logger.info('    │  │  (These run in parallel, so total may be less than sum)')
-                        
+                        logger.info(
+                            '    │  │  (These run in parallel, so total may be less than sum)'
+                        )
+
                         if 'resolve_extracted_nodes' in node_prof:
                             rn = node_prof['resolve_extracted_nodes']
-                            logger.info(f'    │  ├─ Collect candidates: {rn.get("collect_candidates", 0):.2f}ms')
-                            logger.info(f'    │  ├─ Build indexes: {rn.get("build_indexes", 0):.2f}ms')
-                            logger.info(f'    │  ├─ Resolve with similarity: {rn.get("resolve_similarity", 0):.2f}ms')
-                            logger.info(f'    │  ├─ Resolve with LLM: {rn.get("resolve_llm", 0):.2f}ms')
-                            logger.info(f'    │  ├─ Filter duplicates: {rn.get("filter_duplicates", 0):.2f}ms')
+                            logger.info(
+                                f'    │  ├─ Collect candidates: {rn.get("collect_candidates", 0):.2f}ms'
+                            )
+                            logger.info(
+                                f'    │  ├─ Build indexes: {rn.get("build_indexes", 0):.2f}ms'
+                            )
+                            logger.info(
+                                f'    │  ├─ Resolve with similarity: {rn.get("resolve_similarity", 0):.2f}ms'
+                            )
+                            logger.info(
+                                f'    │  ├─ Resolve with LLM: {rn.get("resolve_llm", 0):.2f}ms'
+                            )
+                            logger.info(
+                                f'    │  ├─ Filter duplicates: {rn.get("filter_duplicates", 0):.2f}ms'
+                            )
                             logger.info(f'    │  └─ Subtotal: {rn.get("total", 0):.2f}ms')
                         else:
                             logger.info('    │  └─ (profiling data not available)')
-                            
+
                         logger.info('    │')
                         logger.info('    └─ extract_edges():')
-                        
+
                         if 'extract_edges' in edge_prof:
                             ee = edge_prof['extract_edges']
-                            logger.info(f'       ├─ Context preparation: {ee.get("context_prep", 0):.2f}ms')
-                            logger.info(f'       ├─ LLM calls: {ee.get("llm_total_time", 0):.2f}ms ({int(ee.get("llm_calls", 0))} calls)')
-                            logger.info(f'       ├─ Edge object creation: {ee.get("edge_creation", 0):.2f}ms')
+                            logger.info(
+                                f'       ├─ Context preparation: {ee.get("context_prep", 0):.2f}ms'
+                            )
+                            logger.info(
+                                f'       ├─ LLM calls: {ee.get("llm_total_time", 0):.2f}ms ({int(ee.get("llm_calls", 0))} calls)'
+                            )
+                            logger.info(
+                                f'       ├─ Edge object creation: {ee.get("edge_creation", 0):.2f}ms'
+                            )
                             logger.info(f'       └─ Subtotal: {ee.get("total", 0):.2f}ms')
                         else:
                             logger.info('       └─ (profiling data not available)')
-                    
+
                     # Show detailed breakdown for resolve_extracted_edges_and_extract_attributes
                     if step_name == 'resolve_extracted_edges_and_extract_attributes':
                         logger.info('    │')
                         logger.info('    ├─ resolve_extracted_edges():')
-                        logger.info('    │  │  (These run in parallel, so total may be less than sum)')
-                        
+                        logger.info(
+                            '    │  │  (These run in parallel, so total may be less than sum)'
+                        )
+
                         if 'resolve_extracted_edges' in edge_prof:
                             re = edge_prof['resolve_extracted_edges']
-                            logger.info(f'    │  ├─ Create embeddings: {re.get("create_embeddings", 0):.2f}ms')
-                            logger.info(f'    │  ├─ Get existing edges: {re.get("get_existing_edges", 0):.2f}ms')
-                            logger.info(f'    │  ├─ Search related edges: {re.get("search_related_edges", 0):.2f}ms')
-                            logger.info(f'    │  ├─ Search invalidation candidates: {re.get("search_invalidation_candidates", 0):.2f}ms')
-                            logger.info(f'    │  ├─ Prepare edge types: {re.get("prepare_edge_types", 0):.2f}ms')
-                            logger.info(f'    │  ├─ Resolve individual edges (LLM): {re.get("resolve_individual_edges", 0):.2f}ms')
-                            logger.info(f'    │  ├─ Final embeddings: {re.get("final_embeddings", 0):.2f}ms')
+                            logger.info(
+                                f'    │  ├─ Create embeddings: {re.get("create_embeddings", 0):.2f}ms'
+                            )
+                            logger.info(
+                                f'    │  ├─ Get existing edges: {re.get("get_existing_edges", 0):.2f}ms'
+                            )
+                            logger.info(
+                                f'    │  ├─ Search related edges: {re.get("search_related_edges", 0):.2f}ms'
+                            )
+                            logger.info(
+                                f'    │  ├─ Search invalidation candidates: {re.get("search_invalidation_candidates", 0):.2f}ms'
+                            )
+                            logger.info(
+                                f'    │  ├─ Prepare edge types: {re.get("prepare_edge_types", 0):.2f}ms'
+                            )
+                            logger.info(
+                                f'    │  ├─ Resolve individual edges (LLM): {re.get("resolve_individual_edges", 0):.2f}ms'
+                            )
+                            logger.info(
+                                f'    │  ├─ Final embeddings: {re.get("final_embeddings", 0):.2f}ms'
+                            )
                             logger.info(f'    │  └─ Subtotal: {re.get("total", 0):.2f}ms')
                         else:
                             logger.info('    │  └─ (profiling data not available)')
-                            
+
                         logger.info('    │')
                         logger.info('    └─ extract_attributes_from_nodes():')
-                        
+
                         if 'extract_attributes_from_nodes' in node_prof:
                             ea = node_prof['extract_attributes_from_nodes']
-                            logger.info(f'       ├─ Extract attributes (LLM): {ea.get("extract_attributes_llm", 0):.2f}ms')
-                            logger.info(f'       ├─ Create embeddings: {ea.get("create_embeddings", 0):.2f}ms')
+                            logger.info(
+                                f'       ├─ Extract attributes (LLM): {ea.get("extract_attributes_llm", 0):.2f}ms'
+                            )
+                            logger.info(
+                                f'       ├─ Create embeddings: {ea.get("create_embeddings", 0):.2f}ms'
+                            )
                             logger.info(f'       └─ Subtotal: {ea.get("total", 0):.2f}ms')
                         else:
                             logger.info('       └─ (profiling data not available)')
-                        
+
                 logger.info('=' * 80)
                 logger.info(f'  TOTAL: {total_time:.2f} ms')
                 logger.info('=' * 80)
-                
+
                 # Clear profiling data for next run
                 clear_node_profiling_data()
                 clear_edge_profiling_data()
@@ -1181,13 +1232,13 @@ class Graphiti:
     ) -> list[dict[str, Any]]:
         """
         Retrieve contradictions for a specific group.
-        
+
         This method retrieves edges that were invalidated due to contradictions,
         providing audit trail and proof of why information changed.
-        
+
         **Note**: This feature is only available when using SpannerDriver with
         `save_contradicted_edges=True` enabled.
-        
+
         Parameters
         ----------
         group_id : str | None, optional
@@ -1195,7 +1246,7 @@ class Graphiti:
             for the current driver.
         limit : int, optional
             Maximum number of contradictions to retrieve. Defaults to 100.
-            
+
         Returns
         -------
         list[dict[str, any]]
@@ -1205,41 +1256,41 @@ class Graphiti:
             - invalidating: dict with 'uuid', 'fact', and 'created_at' of the invalidating edge
             - invalidated_at: Timestamp when invalidation occurred
             - created_at: Timestamp when contradiction was recorded
-            
+
         Raises
         ------
         ValueError
             If the driver is not a SpannerDriver instance.
-            
+
         Examples
         --------
         Get all contradictions for the default group:
-        
+
         >>> contradictions = await graphiti.get_contradictions()
         >>> for c in contradictions:
-        ...     print(f"{c['invalidated']['fact']} → {c['invalidating']['fact']}")
-        ...     print(f"Old edge created: {c['invalidated']['created_at']}")
-        ...     print(f"New edge created: {c['invalidating']['created_at']}")
-        
+        ...     print(f'{c["invalidated"]["fact"]} → {c["invalidating"]["fact"]}')
+        ...     print(f'Old edge created: {c["invalidated"]["created_at"]}')
+        ...     print(f'New edge created: {c["invalidating"]["created_at"]}')
+
         Get contradictions for a specific group:
-        
+
         >>> contradictions = await graphiti.get_contradictions(group_id='user-123', limit=50)
-        
+
         Notes
         -----
         This method requires:
         1. SpannerDriver as the graph driver
         2. `save_contradicted_edges=True` when initializing Graphiti
         3. At least one contradiction to have occurred
-        
+
         If no contradictions are found, returns an empty list.
         """
         from graphiti_core.utils.contradicted_edges_utils import get_all_contradictions_for_group
-        
+
         # Use default group_id if not provided
         if group_id is None:
             group_id = get_default_group_id(self.driver.provider)
-        
+
         return await get_all_contradictions_for_group(self.driver, group_id, limit)
 
     async def add_triplet(
