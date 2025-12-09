@@ -1710,8 +1710,20 @@ class SpannerDriver(GraphDriver):
                             return [], None, None
                         finally:
                             await session.close()
+                    else:
+                        # Parser failed for INSERT OR UPDATE query
+                        if 'INSERT OR UPDATE' in cypher_query_.upper():
+                            logger.warning(
+                                f'[BATCH_WRITE] Failed to parse INSERT OR UPDATE query. '
+                                f'Query: {cypher_query_[:200]}... Params: {list(kwargs.keys())}'
+                            )
 
                 # Fallback to transactional write for other queries or if BatchWrite is disabled
+                # Log the query type to help debug 409 conflicts
+                logger.info(
+                    f'[TRANSACTION] Fallback to transactional write. '
+                    f'Query type: {cypher_query_[:50]}...'
+                )
                 max_retries = SPANNER_RETRY_CONFIG['max_retries']
 
                 for attempt in range(max_retries + 1):
