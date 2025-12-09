@@ -1694,9 +1694,22 @@ class SpannerDriver(GraphDriver):
             f'[CONTRADICTED EDGES] Saving {len(invalidated_edges)} contradicted edges to Spanner'
         )
 
-        # Prepare mutation rows
-        mutations = []
+        # Prepare mutation data as dictionaries for run_mutations_batch_write
+        mutations_data: list[dict[str, Any]] = []
         now = datetime.now(timezone.utc)
+
+        columns = [
+            'uuid',
+            'invalidated_edge_uuid',
+            'invalidating_edge_uuid',
+            'invalidated_fact',
+            'invalidating_fact',
+            'invalidated_at',
+            'group_id',
+            'invalidated_edge_data',
+            'invalidating_edge_data',
+            'created_at',
+        ]
 
         for invalidated_edge, invalidating_edge in invalidated_edges:
             # Create a unique UUID for this contradicted edge record
@@ -1741,50 +1754,32 @@ class SpannerDriver(GraphDriver):
                 'attributes': invalidating_edge.attributes,
             }
 
-            # Create mutation for ContradictedEdge table
-            from graphiti_core.driver.spanner_driver import _convert_value_for_mutation
-
-            mutation = types.Mutation(
-                insert=types.Mutation.Write(
-                    table='ContradictedEdge',
-                    columns=[
-                        'uuid',
-                        'invalidated_edge_uuid',
-                        'invalidating_edge_uuid',
-                        'invalidated_fact',
-                        'invalidating_fact',
-                        'invalidated_at',
-                        'group_id',
-                        'invalidated_edge_data',
-                        'invalidating_edge_data',
-                        'created_at',
+            # Build mutation dictionary for BatchWrite
+            mutations_data.append(
+                {
+                    'table': 'ContradictedEdge',
+                    'columns': columns,
+                    'values': [
+                        record_uuid,
+                        invalidated_edge.uuid,
+                        invalidating_edge.uuid,
+                        invalidated_edge.fact,
+                        invalidating_edge.fact,
+                        invalidated_edge.invalid_at if invalidated_edge.invalid_at else now,
+                        group_id,
+                        json.dumps(invalidated_data),
+                        json.dumps(invalidating_data),
+                        now,
                     ],
-                    values=[
-                        [
-                            _convert_value_for_mutation(record_uuid),
-                            _convert_value_for_mutation(invalidated_edge.uuid),
-                            _convert_value_for_mutation(invalidating_edge.uuid),
-                            _convert_value_for_mutation(invalidated_edge.fact),
-                            _convert_value_for_mutation(invalidating_edge.fact),
-                            _convert_value_for_mutation(
-                                invalidated_edge.invalid_at if invalidated_edge.invalid_at else now
-                            ),
-                            _convert_value_for_mutation(group_id),
-                            _convert_value_for_mutation(json.dumps(invalidated_data)),
-                            _convert_value_for_mutation(json.dumps(invalidating_data)),
-                            _convert_value_for_mutation(now),
-                        ]
-                    ],
-                )
+                }
             )
-            mutations.append(mutation)
 
         # Execute mutations using BatchWrite if enabled (conflict-free), otherwise use transaction
         if SPANNER_BATCH_WRITE_CONFIG['enabled']:
             # Use BatchWrite for conflict-free writes
             session = SpannerDriverSession(self.client, self.database_path)
             try:
-                successful, failed = await session.run_mutations_batch_write(mutations)
+                successful, failed = await session.run_mutations_batch_write(mutations_data)
                 if failed > 0:
                     logger.warning(
                         f'[CONTRADICTED EDGES] BatchWrite: {successful} succeeded, {failed} failed'
@@ -1797,7 +1792,21 @@ class SpannerDriver(GraphDriver):
             finally:
                 await session.close()
         else:
-            # Fallback to transactional write
+            # Fallback to transactional write - need to build Mutation objects
+            mutations = []
+            for mut_data in mutations_data:
+                converted_values = [
+                    _convert_value_for_mutation(v) for v in mut_data['values']
+                ]
+                mutation = types.Mutation(
+                    insert=types.Mutation.Write(
+                        table=mut_data['table'],
+                        columns=mut_data['columns'],
+                        values=[converted_values],
+                    )
+                )
+                mutations.append(mutation)
+
             session_name = await self.session_pool.acquire()
             try:
                 # Begin transaction
