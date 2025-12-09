@@ -381,9 +381,19 @@ class EpisodicNode(Node):
                 [episode_args],
             )
 
-        result = await driver.execute_query(
-            get_episode_node_save_query(driver.provider), **episode_args
-        )
+        if driver.provider == GraphProvider.SPANNER:
+            # Spanner needs entity_edges serialized as JSON
+            spanner_args = episode_args.copy()
+            spanner_args['entity_edges'] = (
+                json.dumps(self.entity_edges) if self.entity_edges else '[]'
+            )
+            result = await driver.execute_query(
+                get_episode_node_save_query(driver.provider), **spanner_args
+            )
+        else:
+            result = await driver.execute_query(
+                get_episode_node_save_query(driver.provider), **episode_args
+            )
 
         logger.debug(f'Saved Node to Graph: {self.uuid}')
 
@@ -563,6 +573,22 @@ class EntityNode(Node):
             result = await driver.execute_query(
                 get_entity_node_save_query(driver.provider, labels=''),
                 **entity_data,
+            )
+        elif driver.provider == GraphProvider.SPANNER:
+            # Spanner uses individual params with exact column names
+            spanner_node_data = {
+                'uuid': self.uuid,
+                'name': self.name,
+                'name_embedding': self.name_embedding,
+                'group_id': self.group_id,
+                'summary': self.summary,
+                'created_at': self.created_at,
+                'labels': json.dumps(list(set(self.labels + ['Entity']))),
+                'attributes': json.dumps(self.attributes) if self.attributes else '{}',
+            }
+            result = await driver.execute_query(
+                get_entity_node_save_query(driver.provider, labels=''),
+                **spanner_node_data,
             )
         else:
             entity_data.update(self.attributes or {})

@@ -36,6 +36,7 @@ from graphiti_core.models.edges.edge_db_queries import (
     get_community_edge_save_query,
     get_entity_edge_return_query,
     get_entity_edge_save_query,
+    get_episodic_edge_save_bulk_query,
 )
 from graphiti_core.nodes import Node
 
@@ -137,14 +138,25 @@ class Edge(BaseModel, ABC):
 
 class EpisodicEdge(Edge):
     async def save(self, driver: GraphDriver):
-        result = await driver.execute_query(
-            EPISODIC_EDGE_SAVE,
-            episode_uuid=self.source_node_uuid,
-            entity_uuid=self.target_node_uuid,
-            uuid=self.uuid,
-            group_id=self.group_id,
-            created_at=self.created_at,
-        )
+        if driver.provider == GraphProvider.SPANNER:
+            # Spanner uses individual params with exact column names
+            result = await driver.execute_query(
+                get_episodic_edge_save_bulk_query(driver.provider),
+                uuid=self.uuid,
+                source_node_uuid=self.source_node_uuid,
+                target_node_uuid=self.target_node_uuid,
+                group_id=self.group_id,
+                created_at=self.created_at,
+            )
+        else:
+            result = await driver.execute_query(
+                EPISODIC_EDGE_SAVE,
+                episode_uuid=self.source_node_uuid,
+                entity_uuid=self.target_node_uuid,
+                uuid=self.uuid,
+                group_id=self.group_id,
+                created_at=self.created_at,
+            )
 
         logger.debug(f'Saved edge to Graph: {self.uuid}')
 
@@ -322,6 +334,24 @@ class EntityEdge(Edge):
             result = await driver.execute_query(
                 get_entity_edge_save_query(driver.provider, has_aoss=bool(driver.aoss_client)),
                 **edge_data,
+            )
+        elif driver.provider == GraphProvider.SPANNER:
+            # Spanner uses individual params with different column names
+            result = await driver.execute_query(
+                get_entity_edge_save_query(driver.provider),
+                uuid=self.uuid,
+                source_node_uuid=self.source_node_uuid,
+                target_node_uuid=self.target_node_uuid,
+                group_id=self.group_id,
+                created_at=self.created_at,
+                name=self.name,
+                fact=self.fact,
+                fact_embedding=self.fact_embedding,
+                episodes=self.episodes,
+                expired_at=self.expired_at,
+                valid_at=self.valid_at,
+                invalid_at=self.invalid_at,
+                attributes=json.dumps(self.attributes) if self.attributes else '{}',
             )
         else:
             edge_data.update(self.attributes or {})
