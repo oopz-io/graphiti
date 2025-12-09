@@ -53,6 +53,100 @@ SPANNER_BATCH_WRITE_CONFIG = {
     'timeout_seconds': 300,  # Timeout for batch write operations (5 minutes)
 }
 
+# Configuration for Session Pool
+# Adjust these based on your concurrent workload
+SPANNER_SESSION_POOL_CONFIG = {
+    'min_size': 5,  # Pre-warmed sessions (created on initialization)
+    'max_size': 50,  # Maximum concurrent sessions (increase for high concurrency)
+    'acquire_timeout_seconds': 30,  # Max time to wait for a session
+    'log_exhaustion_as_warning': False,  # Set to True to log pool exhaustion as WARNING
+}
+
+
+def _parse_insert_or_update_query(
+    query: str, params: dict[str, Any]
+) -> dict[str, Any] | None:
+    """
+    Parse an INSERT OR UPDATE query and extract table, columns, and values.
+
+    This allows converting SQL upsert queries to BatchWrite mutations for
+    conflict-free parallel execution.
+
+    Args:
+        query: SQL query string (INSERT OR UPDATE ...)
+        params: Query parameters dictionary
+
+    Returns:
+        Dictionary with 'table', 'columns', 'values' if parseable, None otherwise
+
+    Example:
+        query = "INSERT OR UPDATE EntityEdge (uuid, name) VALUES (@uuid, @name)"
+        params = {'uuid': 'abc', 'name': 'test'}
+        -> {'table': 'EntityEdge', 'columns': ['uuid', 'name'], 'values': ['abc', 'test']}
+    """
+    query_upper = query.strip().upper()
+    if not query_upper.startswith('INSERT OR UPDATE'):
+        return None
+
+    try:
+        # Extract table name: INSERT OR UPDATE TableName (columns...)
+        # Find the table name between "INSERT OR UPDATE" and "("
+        start_idx = len('INSERT OR UPDATE')
+        paren_idx = query.find('(', start_idx)
+        if paren_idx == -1:
+            return None
+
+        table_name = query[start_idx:paren_idx].strip()
+
+        # Extract columns: (col1, col2, col3)
+        # Find closing paren for columns
+        col_end_idx = query.find(')', paren_idx)
+        if col_end_idx == -1:
+            return None
+
+        columns_str = query[paren_idx + 1 : col_end_idx]
+        columns = [c.strip() for c in columns_str.split(',')]
+
+        # Extract values: VALUES (@param1, @param2, ...)
+        values_idx = query_upper.find('VALUES')
+        if values_idx == -1:
+            return None
+
+        values_start = query.find('(', values_idx)
+        values_end = query.find(')', values_start)
+        if values_start == -1 or values_end == -1:
+            return None
+
+        values_str = query[values_start + 1 : values_end]
+        value_placeholders = [v.strip() for v in values_str.split(',')]
+
+        # Resolve parameter values
+        values = []
+        for placeholder in value_placeholders:
+            # Handle @param_name format
+            if placeholder.startswith('@'):
+                param_name = placeholder[1:]
+                if param_name in params:
+                    values.append(params[param_name])
+                else:
+                    # Parameter not found
+                    return None
+            else:
+                # Literal value (shouldn't happen but handle gracefully)
+                return None
+
+        if len(columns) != len(values):
+            return None
+
+        return {
+            'table': table_name,
+            'columns': columns,
+            'values': values,
+        }
+
+    except Exception:
+        return None
+
 
 def _calculate_retry_delay(attempt: int, config: dict = SPANNER_RETRY_CONFIG) -> float:
     """
@@ -122,8 +216,8 @@ class SessionPool:
         self,
         client: spanner_v1.SpannerAsyncClient,
         database_path: str,
-        min_size: int = 1,
-        max_size: int = 10,
+        min_size: int | None = None,
+        max_size: int | None = None,
     ):
         """
         Initialize the session pool.
@@ -131,16 +225,23 @@ class SessionPool:
         Args:
             client: The Spanner async client
             database_path: Full path to the database
-            min_size: Minimum number of sessions to maintain (warmed up)
-            max_size: Maximum number of sessions in the pool
+            min_size: Minimum number of sessions to maintain (warmed up).
+                      Defaults to SPANNER_SESSION_POOL_CONFIG['min_size']
+            max_size: Maximum number of sessions in the pool.
+                      Defaults to SPANNER_SESSION_POOL_CONFIG['max_size']
         """
         self.client = client
         self.database_path = database_path
-        self.min_size = min_size
-        self.max_size = max_size
+        self.min_size = (
+            min_size if min_size is not None else SPANNER_SESSION_POOL_CONFIG['min_size']
+        )
+        self.max_size = (
+            max_size if max_size is not None else SPANNER_SESSION_POOL_CONFIG['max_size']
+        )
         self._pool: list[str] = []  # List of available session names
         self._in_use: set[str] = set()  # Set of session names currently in use
         self._lock = asyncio.Lock()
+        self._semaphore = asyncio.Semaphore(self.max_size)  # Limit concurrent waiters
         self._initialized = False
 
     async def initialize(self):
@@ -182,8 +283,14 @@ class SessionPool:
         """
         Get a session from the pool or create a new one if needed.
 
+        Uses a semaphore to properly queue waiters when pool is exhausted,
+        avoiding recursive retry loops and providing timeout support.
+
         Returns:
             Session name (string)
+
+        Raises:
+            TimeoutError: If session cannot be acquired within timeout
         """
         # Ensure pool is initialized
         if not self._initialized:
@@ -191,35 +298,57 @@ class SessionPool:
                 '[SESSION POOL] acquire() called but pool not initialized - initializing now...'
             )
             await self.initialize()
-        else:
-            logger.debug('[SESSION POOL] acquire() called - pool already initialized')
 
-        async with self._lock:
-            # Try to get a session from the pool
-            if self._pool:
-                session_name = self._pool.pop()
-                self._in_use.add(session_name)
-                logger.debug(
-                    f'[SESSION POOL] Acquired session from pool (available: {len(self._pool)}, in use: {len(self._in_use)})'
+        timeout = SPANNER_SESSION_POOL_CONFIG['acquire_timeout_seconds']
+        start_time = asyncio.get_event_loop().time()
+
+        while True:
+            async with self._lock:
+                # Try to get a session from the pool
+                if self._pool:
+                    session_name = self._pool.pop()
+                    self._in_use.add(session_name)
+                    logger.debug(
+                        f'[SESSION POOL] Acquired session from pool '
+                        f'(available: {len(self._pool)}, in use: {len(self._in_use)})'
+                    )
+                    return session_name
+
+                # If pool is empty but we haven't hit max size, create a new session
+                total_sessions = len(self._pool) + len(self._in_use)
+                if total_sessions < self.max_size:
+                    logger.debug(
+                        f'[SESSION POOL] Creating new session '
+                        f'(total: {total_sessions}/{self.max_size})'
+                    )
+                    session_name = await self._create_session()
+                    self._in_use.add(session_name)
+                    return session_name
+
+                # Pool exhausted - log at appropriate level
+                if SPANNER_SESSION_POOL_CONFIG['log_exhaustion_as_warning']:
+                    logger.warning(
+                        f'[SESSION POOL] Pool exhausted ({self.max_size}/{self.max_size}), '
+                        'waiting for session...'
+                    )
+                else:
+                    logger.info(
+                        f'[SESSION POOL] Pool exhausted ({self.max_size}/{self.max_size}), '
+                        'waiting for session...'
+                    )
+
+            # Check timeout
+            elapsed = asyncio.get_event_loop().time() - start_time
+            if elapsed >= timeout:
+                raise TimeoutError(
+                    f'[SESSION POOL] Timeout after {timeout}s waiting for session. '
+                    f'Pool size: {self.max_size}, all sessions in use. '
+                    'Consider increasing SPANNER_SESSION_POOL_CONFIG["max_size"].'
                 )
-                return session_name
 
-            # If pool is empty but we haven't hit max size, create a new session
-            total_sessions = len(self._pool) + len(self._in_use)
-            if total_sessions < self.max_size:
-                logger.debug(
-                    f'[SESSION POOL] Creating new session (total: {total_sessions}/{self.max_size})'
-                )
-                session_name = await self._create_session()
-                self._in_use.add(session_name)
-                return session_name
-
-            # If we're at max capacity, wait and retry (this shouldn't happen often with proper sizing)
-            logger.warning('[SESSION POOL] Pool exhausted! Waiting for session to be released...')
-
-        # Wait a bit and retry
-        await asyncio.sleep(0.1)
-        return await self.acquire()
+            # Wait a bit before retry (with exponential backoff capped at 500ms)
+            wait_time = min(0.05 * (1 + elapsed), 0.5)
+            await asyncio.sleep(wait_time)
 
     async def release(self, session_name: str):
         """
@@ -1030,7 +1159,7 @@ class SpannerDriver(GraphDriver):
         instance_id: str,
         database_id: str,
         credentials: Any = None,
-        session_pool_size: int = 20,
+        session_pool_size: int | None = None,
         ensure_schema: bool = False,
     ):
         """Initialize the Spanner driver.
@@ -1045,7 +1174,8 @@ class SpannerDriver(GraphDriver):
             instance_id: The Spanner instance ID
             database_id: The Spanner database ID
             credentials: Optional credentials object
-            session_pool_size: Maximum number of sessions in the pool (default: 20)
+            session_pool_size: Maximum number of sessions in the pool.
+                             Defaults to SPANNER_SESSION_POOL_CONFIG['max_size'] (50).
             ensure_schema: If True, schema will be initialized when using the create() factory method.
                          If False (default), schema initialization is skipped entirely.
                          This parameter only takes effect when using create(), not the constructor.
@@ -1061,14 +1191,22 @@ class SpannerDriver(GraphDriver):
 
         self._database = database_id
 
+        # Determine pool sizes from parameter or config
+        max_pool_size = (
+            session_pool_size
+            if session_pool_size is not None
+            else SPANNER_SESSION_POOL_CONFIG['max_size']
+        )
+        min_pool_size = min(SPANNER_SESSION_POOL_CONFIG['min_size'], max_pool_size)
+
         # Initialize session pool
         # Pre-warm with sessions to handle concurrent operations during add_episode
         # (typical first episode needs 6-8 concurrent sessions)
         self.session_pool = SessionPool(
             client=self.client,
             database_path=self.database_path,
-            min_size=min(5, session_pool_size),  # Pre-warm up to 5 sessions, but not more than max
-            max_size=session_pool_size,
+            min_size=min_pool_size,
+            max_size=max_pool_size,
         )
 
         # Store the schema initialization flag
@@ -1087,7 +1225,7 @@ class SpannerDriver(GraphDriver):
         instance_id: str,
         database_id: str,
         credentials: Any = None,
-        session_pool_size: int = 20,
+        session_pool_size: int | None = None,
         ensure_schema: bool = False,
     ) -> 'SpannerDriver':
         """Async factory method to create a SpannerDriver with pre-warmed session pool.
@@ -1109,7 +1247,8 @@ class SpannerDriver(GraphDriver):
             instance_id: The Spanner instance ID
             database_id: The Spanner database ID
             credentials: Optional credentials object
-            session_pool_size: Maximum number of sessions in the pool (default: 20)
+            session_pool_size: Maximum number of sessions in the pool.
+                             Defaults to SPANNER_SESSION_POOL_CONFIG['max_size'] (50).
             ensure_schema: If True, initialize the database schema during driver creation.
                          If False (default), schema initialization is skipped entirely.
 
@@ -1547,7 +1686,32 @@ class SpannerDriver(GraphDriver):
                 )
 
             else:
-                # For write queries, use transaction with retry logic for conflicts
+                # For write queries, check if we can use BatchWrite for INSERT OR UPDATE
+                # This eliminates 409 conflicts for parallel upsert operations
+                if SPANNER_BATCH_WRITE_CONFIG['enabled']:
+                    mutation_data = _parse_insert_or_update_query(cypher_query_, kwargs)
+                    if mutation_data:
+                        # Use BatchWrite for this INSERT OR UPDATE query
+                        logger.debug(
+                            f'[BATCH_WRITE] Converting INSERT OR UPDATE to BatchWrite: '
+                            f'{mutation_data["table"]}'
+                        )
+                        session = SpannerDriverSession(self.client, self.database_path)
+                        try:
+                            successful, failed = await session.run_mutations_batch_write(
+                                [mutation_data], mutations_per_group=1
+                            )
+                            if failed > 0:
+                                logger.warning(
+                                    f'[BATCH_WRITE] execute_query mutation failed: '
+                                    f'{mutation_data["table"]}'
+                                )
+                            # Return empty result (INSERT OR UPDATE doesn't return rows)
+                            return [], None, None
+                        finally:
+                            await session.close()
+
+                # Fallback to transactional write for other queries or if BatchWrite is disabled
                 max_retries = SPANNER_RETRY_CONFIG['max_retries']
 
                 for attempt in range(max_retries + 1):
