@@ -1720,9 +1720,9 @@ class SpannerDriver(GraphDriver):
 
                 # Fallback to transactional write for other queries or if BatchWrite is disabled
                 # Log the query type to help debug 409 conflicts
-                logger.info(
-                    f'[TRANSACTION] Fallback to transactional write. '
-                    f'Query type: {cypher_query_[:50]}...'
+                logger.warning(
+                    f'[TRANSACTION] Fallback to transactional write (potential 409 source). '
+                    f'Query: {cypher_query_[:150]}'
                 )
                 max_retries = SPANNER_RETRY_CONFIG['max_retries']
 
