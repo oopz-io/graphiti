@@ -1880,6 +1880,16 @@ class SpannerDriver(GraphDriver):
             record_uuid = str(uuid4())
 
             # Serialize full edge data as JSON for audit trail
+            # Use a helper to serialize datetime objects in attributes
+            def serialize_value(v: Any) -> Any:
+                if isinstance(v, datetime):
+                    return v.isoformat()
+                if isinstance(v, dict):
+                    return {k: serialize_value(val) for k, val in v.items()}
+                if isinstance(v, list):
+                    return [serialize_value(item) for item in v]
+                return v
+
             invalidated_data = {
                 'uuid': invalidated_edge.uuid,
                 'name': invalidated_edge.name,
@@ -1899,7 +1909,7 @@ class SpannerDriver(GraphDriver):
                 'expired_at': invalidated_edge.expired_at.isoformat()
                 if invalidated_edge.expired_at
                 else None,
-                'attributes': invalidated_edge.attributes,
+                'attributes': serialize_value(invalidated_edge.attributes),
             }
 
             invalidating_data = {
@@ -1915,7 +1925,7 @@ class SpannerDriver(GraphDriver):
                 'valid_at': invalidating_edge.valid_at.isoformat()
                 if invalidating_edge.valid_at
                 else None,
-                'attributes': invalidating_edge.attributes,
+                'attributes': serialize_value(invalidating_edge.attributes),
             }
 
             # Build mutation dictionary for BatchWrite
