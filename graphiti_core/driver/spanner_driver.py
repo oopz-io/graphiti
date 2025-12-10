@@ -1603,19 +1603,30 @@ class SpannerDriver(GraphDriver):
             query_upper = cypher_query_.strip().upper()
 
             # Check for write keywords with word boundaries to avoid false positives (e.g., created_at contains CREATE)
-            write_keywords = ['CREATE', 'UPDATE', 'DELETE', 'MERGE', 'SET']
+            write_keywords = ['INSERT', 'UPDATE', 'DELETE', 'MERGE']
             found_write_keywords = [
                 kw for kw in write_keywords if re.search(r'\b' + kw + r'\b', query_upper)
             ]
 
-            is_read_query = query_upper.startswith('SELECT') or (
+            # Detect read queries:
+            # - SELECT ... (direct select)
+            # - WITH ... SELECT ... (CTE followed by select - common for vector searches)
+            # - GRAPH ... MATCH ... (graph read operations without write keywords)
+            is_select_query = query_upper.startswith('SELECT')
+            is_cte_query = query_upper.startswith('WITH') and 'SELECT' in query_upper
+            is_graph_read_query = (
                 query_upper.startswith('GRAPH')
                 and 'MATCH' in query_upper
                 and not found_write_keywords
             )
 
+            is_read_query = (
+                (is_select_query or is_cte_query or is_graph_read_query)
+                and not found_write_keywords
+            )
+
             # Check if this is a SEARCH query (requires read-only transaction)
-            uses_search = 'SEARCH(' in query_upper
+            uses_search = 'SEARCH(' in query_upper or 'COSINE_DISTANCE' in query_upper
 
             if is_read_query:
                 exec_start = time.perf_counter()
