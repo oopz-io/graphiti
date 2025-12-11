@@ -1463,12 +1463,40 @@ class SpannerDriver(GraphDriver):
                   invalidated_fact_tokens TOKENLIST AS (TOKENIZE_FULLTEXT(invalidated_fact)) HIDDEN,
                   invalidating_fact_tokens TOKENLIST AS (TOKENIZE_FULLTEXT(invalidating_fact)) HIDDEN
                 ) PRIMARY KEY(uuid)""",
-                # Create search indexes
+                # Create search indexes for full-text search
                 """CREATE SEARCH INDEX EntityNode_search_index ON EntityNode(name_tokens, summary_tokens)""",
                 """CREATE SEARCH INDEX EntityEdge_search_index ON EntityEdge(name_tokens, fact_tokens)""",
                 """CREATE SEARCH INDEX EpisodicNode_search_index ON EpisodicNode(content_tokens, source_tokens, source_description_tokens)""",
                 """CREATE SEARCH INDEX CommunityNode_search_index ON CommunityNode(name_tokens)""",
                 """CREATE SEARCH INDEX ContradictedEdge_search_index ON ContradictedEdge(invalidated_fact_tokens, invalidating_fact_tokens)""",
+                # ============================================================
+                # Secondary indexes for group_id filtering (user/tenant isolation)
+                # ============================================================
+                # Priority 1: Essential group_id indexes
+                # These are critical for filtering by user (group_id) in all search operations
+                # Without these, Spanner performs full table scans for group_id predicates
+                """CREATE INDEX EpisodicNode_group_id_idx ON EpisodicNode(group_id)""",
+                """CREATE INDEX EntityNode_group_id_idx ON EntityNode(group_id)""",
+                """CREATE INDEX EntityEdge_group_id_idx ON EntityEdge(group_id)""",
+                """CREATE INDEX EpisodicEdge_group_id_idx ON EpisodicEdge(group_id)""",
+                """CREATE INDEX CommunityNode_group_id_idx ON CommunityNode(group_id)""",
+                # ============================================================
+                # Graph traversal indexes (source/target node lookups)
+                # ============================================================
+                # Priority 2: Optimize edge lookups during BFS/MATCH traversals
+                # Used when following edges from node to node in graph queries
+                """CREATE INDEX EntityEdge_source_node_idx ON EntityEdge(source_node_uuid)""",
+                """CREATE INDEX EntityEdge_target_node_idx ON EntityEdge(target_node_uuid)""",
+                """CREATE INDEX EpisodicEdge_source_node_idx ON EpisodicEdge(source_node_uuid)""",
+                """CREATE INDEX EpisodicEdge_target_node_idx ON EpisodicEdge(target_node_uuid)""",
+                # ============================================================
+                # Composite indexes (group_id + graph traversal)
+                # ============================================================
+                # Priority 3: Advanced optimization for queries filtering by group_id AND traversing
+                # These allow Spanner to satisfy both predicates from a single index scan
+                # Example: MATCH (e:Episodic)-[]->(:Entity) WHERE e.group_id = 'user_123'
+                """CREATE INDEX EntityEdge_group_source_idx ON EntityEdge(group_id, source_node_uuid)""",
+                """CREATE INDEX EpisodicEdge_group_source_idx ON EpisodicEdge(group_id, source_node_uuid)""",
             ]
 
             # Property graph definition - created separately to handle partial schema scenarios
