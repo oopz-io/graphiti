@@ -1463,37 +1463,117 @@ class SpannerDriver(GraphDriver):
                   invalidated_fact_tokens TOKENLIST AS (TOKENIZE_FULLTEXT(invalidated_fact)) HIDDEN,
                   invalidating_fact_tokens TOKENLIST AS (TOKENIZE_FULLTEXT(invalidating_fact)) HIDDEN
                 ) PRIMARY KEY(uuid)""",
-                # Create search indexes for full-text search
-                """CREATE SEARCH INDEX EntityNode_search_index ON EntityNode(name_tokens, summary_tokens)""",
-                """CREATE SEARCH INDEX EntityEdge_search_index ON EntityEdge(name_tokens, fact_tokens)""",
-                """CREATE SEARCH INDEX EpisodicNode_search_index ON EpisodicNode(content_tokens, source_tokens, source_description_tokens)""",
-                """CREATE SEARCH INDEX CommunityNode_search_index ON CommunityNode(name_tokens)""",
-                """CREATE SEARCH INDEX ContradictedEdge_search_index ON ContradictedEdge(invalidated_fact_tokens, invalidating_fact_tokens)""",
                 # ============================================================
-                # Secondary indexes for group_id filtering (user/tenant isolation)
+                # SEARCH INDEXES (Full-Text Search with Partition Isolation)
                 # ============================================================
-                # Priority 1: Essential group_id indexes
-                # These are critical for filtering by user (group_id) in all search operations
-                # Without these, Spanner performs full table scans for group_id predicates
+                # Search indexes enable efficient full-text search using SEARCH() function
+                # and token-based filtering using ARRAY_INCLUDES() with TOKEN().
+                #
+                # PARTITION BY group_id:
+                # - Isolates search operations to a single tenant/user partition
+                # - Queries can only search within a single partition at a time
+                # - Dramatically improves performance for multi-tenant workloads
+                # - Scales horizontally: 1M+ partitions with independent search spaces
+                #
+                # STORING clause:
+                # - Duplicates columns into the search index for covered queries
+                # - Eliminates table lookups after index scan (faster reads)
+                # - Trade-off: Increased storage for reduced latency
+                """CREATE SEARCH INDEX EntityNode_search_index
+                   ON EntityNode(name_tokens, summary_tokens, labels)
+                   STORING (uuid, name, group_id, summary, created_at)
+                   PARTITION BY group_id""",
+                """CREATE SEARCH INDEX EntityEdge_search_index
+                   ON EntityEdge(name_tokens, fact_tokens)
+                   STORING (uuid, name, group_id, fact, source_node_uuid, target_node_uuid, created_at, expired_at)
+                   PARTITION BY group_id""",
+                """CREATE SEARCH INDEX EpisodicNode_search_index
+                   ON EpisodicNode(content_tokens, source_tokens, source_description_tokens)
+                   STORING (uuid, name, group_id, source, source_description, content, created_at, valid_at)
+                   PARTITION BY group_id""",
+                """CREATE SEARCH INDEX CommunityNode_search_index
+                   ON CommunityNode(name_tokens)
+                   STORING (uuid, name, group_id, summary, created_at)
+                   PARTITION BY group_id""",
+                """CREATE SEARCH INDEX ContradictedEdge_search_index
+                   ON ContradictedEdge(invalidated_fact_tokens, invalidating_fact_tokens)
+                   STORING (uuid, invalidated_edge_uuid, invalidating_edge_uuid, invalidated_fact, invalidating_fact, invalidated_at, created_at)
+                   PARTITION BY group_id""",
+                # ============================================================
+                # SECONDARY INDEXES for group_id filtering (Hybrid KNN Strategy)
+                # ============================================================
+                # These indexes are CRITICAL for the Hybrid KNN (Exact K-Nearest Neighbors)
+                # approach used for semantic/vector similarity search.
+                #
+                # WHY HYBRID KNN INSTEAD OF VECTOR INDEX (ANN)?
+                # ---------------------------------------------
+                # Given our data profile:
+                #   - Per partition: 300 – 10,000 records (EntityEdge per group_id)
+                #   - Partitions: 1,000,000+ group_ids (tenants/users)
+                #   - Total records: 300M – 10B+ rows
+                #
+                # A global Vector Index (ANN) would:
+                #   - Build a single massive index across ALL groups
+                #   - Require post-filtering by group_id (inefficient)
+                #   - Provide only ~90-95% recall (approximate results)
+                #   - Have limited horizontal scaling
+                #
+                # The Hybrid KNN approach:
+                #   - Uses secondary index to FIRST isolate the partition (group_id)
+                #   - Then computes exact COSINE_DISTANCE() on 300-10,000 rows only
+                #   - Provides 100% recall (exact nearest neighbors)
+                #   - Scales perfectly: query cost = O(partition size), not O(total data)
+                #
+                # QUERY PATTERN FOR EXACT KNN:
+                # ----------------------------
+                # SELECT uuid, name, fact,
+                #        COSINE_DISTANCE(fact_embedding, @query_embedding) AS distance
+                # FROM EntityEdge
+                # WHERE group_id = @group_id
+                #   AND fact_embedding IS NOT NULL
+                # ORDER BY distance
+                # LIMIT @top_k;
+                #
+                # HOW IT WORKS:
+                # 1. Spanner uses EntityEdge_group_id_idx to seek directly to partition
+                # 2. Scans only 300-10,000 rows within that partition
+                # 3. Computes exact cosine distance for each row (trivial at this scale)
+                # 4. Returns true top-k nearest neighbors (100% recall)
+                #
+                # SCALING CHARACTERISTICS:
+                # ------------------------
+                # | Scale                              | Query Performance           |
+                # |------------------------------------|----------------------------|
+                # | 1M groups × 1K edges = 1B rows     | ✅ Touches ~1K rows only   |
+                # | 10M groups × 5K edges = 50B rows   | ✅ Touches ~5K rows only   |
+                # | Query latency                      | Sub-100ms regardless of    |
+                # |                                    | total database size        |
+                #
+                # WHEN WOULD YOU NEED VECTOR INDEX (ANN)?
+                # - Cross-group semantic search (find similar edges across ALL groups)
+                # - Single partition grows to 100K+ records
+                # - For our multi-tenant use case: NOT NEEDED
                 """CREATE INDEX EpisodicNode_group_id_idx ON EpisodicNode(group_id)""",
                 """CREATE INDEX EntityNode_group_id_idx ON EntityNode(group_id)""",
                 """CREATE INDEX EntityEdge_group_id_idx ON EntityEdge(group_id)""",
                 """CREATE INDEX EpisodicEdge_group_id_idx ON EpisodicEdge(group_id)""",
                 """CREATE INDEX CommunityNode_group_id_idx ON CommunityNode(group_id)""",
+                """CREATE INDEX ContradictedEdge_group_id_idx ON ContradictedEdge(group_id)""",
                 # ============================================================
-                # Graph traversal indexes (source/target node lookups)
+                # GRAPH TRAVERSAL INDEXES (source/target node lookups)
                 # ============================================================
-                # Priority 2: Optimize edge lookups during BFS/MATCH traversals
-                # Used when following edges from node to node in graph queries
+                # Optimize edge lookups during BFS/MATCH traversals.
+                # Used when following edges from node to node in graph queries.
+                # Example: MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity)
                 """CREATE INDEX EntityEdge_source_node_idx ON EntityEdge(source_node_uuid)""",
                 """CREATE INDEX EntityEdge_target_node_idx ON EntityEdge(target_node_uuid)""",
                 """CREATE INDEX EpisodicEdge_source_node_idx ON EpisodicEdge(source_node_uuid)""",
                 """CREATE INDEX EpisodicEdge_target_node_idx ON EpisodicEdge(target_node_uuid)""",
                 # ============================================================
-                # Composite indexes (group_id + graph traversal)
+                # COMPOSITE INDEXES (group_id + graph traversal)
                 # ============================================================
-                # Priority 3: Advanced optimization for queries filtering by group_id AND traversing
-                # These allow Spanner to satisfy both predicates from a single index scan
+                # Advanced optimization for queries filtering by group_id AND traversing.
+                # These allow Spanner to satisfy both predicates from a single index scan.
                 # Example: MATCH (e:Episodic)-[]->(:Entity) WHERE e.group_id = 'user_123'
                 """CREATE INDEX EntityEdge_group_source_idx ON EntityEdge(group_id, source_node_uuid)""",
                 """CREATE INDEX EpisodicEdge_group_source_idx ON EpisodicEdge(group_id, source_node_uuid)""",
