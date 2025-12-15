@@ -1392,7 +1392,9 @@ class SpannerDriver(GraphDriver):
                   summary STRING(MAX),
                   attributes JSON,
                   name_tokens TOKENLIST AS (TOKENIZE_FULLTEXT(name)) HIDDEN,
-                  summary_tokens TOKENLIST AS (TOKENIZE_FULLTEXT(summary)) HIDDEN
+                  summary_tokens TOKENLIST AS (TOKENIZE_FULLTEXT(summary)) HIDDEN,
+                  labels_tokens TOKENLIST AS (TOKEN(labels)) HIDDEN,
+                  name_ngrams_tokens TOKENLIST AS (TOKENIZE_NGRAMS(name, ngram_size_min=>3, ngram_size_max=>4)) HIDDEN
                 ) PRIMARY KEY(uuid)""",
                 """CREATE TABLE EntityEdge (
                   id INT64 DEFAULT (GET_NEXT_SEQUENCE_VALUE(SEQUENCE EntityEdgeSequence)),
@@ -1479,25 +1481,42 @@ class SpannerDriver(GraphDriver):
                 # - Duplicates columns into the search index for covered queries
                 # - Eliminates table lookups after index scan (faster reads)
                 # - Trade-off: Increased storage for reduced latency
+                #
+                # EntityNode search index includes:
+                # - name_tokens: Full-text search on entity names
+                # - summary_tokens: Full-text search on entity summaries
+                # - labels_tokens: TOKEN(labels) for ARRAY_INCLUDES filtering
+                # - name_ngrams_tokens: TOKENIZE_NGRAMS for REGEXP_CONTAINS pattern matching
+                # Note: uuid (primary key), group_id (partition key), and ARRAY fields
+                #       are excluded from STORING as they are implicitly available or not allowed
                 """CREATE SEARCH INDEX EntityNode_search_index
-                   ON EntityNode(name_tokens, summary_tokens, labels)
-                   STORING (uuid, name, group_id, summary, created_at)
+                   ON EntityNode(name_tokens, summary_tokens, labels_tokens, name_ngrams_tokens)
+                   STORING (name, summary, attributes, created_at)
                    PARTITION BY group_id""",
                 """CREATE SEARCH INDEX EntityEdge_search_index
                    ON EntityEdge(name_tokens, fact_tokens)
-                   STORING (uuid, name, group_id, fact, source_node_uuid, target_node_uuid, created_at, expired_at)
+                   STORING (name, fact, source_node_uuid, target_node_uuid, created_at, expired_at, valid_at, invalid_at)
                    PARTITION BY group_id""",
                 """CREATE SEARCH INDEX EpisodicNode_search_index
                    ON EpisodicNode(content_tokens, source_tokens, source_description_tokens)
-                   STORING (uuid, name, group_id, source, source_description, content, created_at, valid_at)
+                   STORING (name, source, source_description, content, created_at, valid_at)
                    PARTITION BY group_id""",
                 """CREATE SEARCH INDEX CommunityNode_search_index
                    ON CommunityNode(name_tokens)
-                   STORING (uuid, name, group_id, summary, created_at)
+                   STORING (name, summary, created_at)
                    PARTITION BY group_id""",
                 """CREATE SEARCH INDEX ContradictedEdge_search_index
                    ON ContradictedEdge(invalidated_fact_tokens, invalidating_fact_tokens)
-                   STORING (uuid, invalidated_edge_uuid, invalidating_edge_uuid, invalidated_fact, invalidating_fact, invalidated_at, created_at)
+                   STORING (invalidated_edge_uuid, invalidating_edge_uuid, invalidated_fact, invalidating_fact, invalidated_at, created_at)
+                   PARTITION BY group_id""",
+                # Custom Entity Index: Optimized for Graph queries filtering by labels + name pattern
+                # Use case: MATCH (p:Entity WHERE SEARCH(labels_tokens, 'User') AND SEARCH_NGRAMS(name_ngrams_tokens, 'pattern'))
+                # - labels_tokens: TOKEN(labels) enables efficient ARRAY_INCLUDES via SEARCH()
+                # - name_ngrams_tokens: TOKENIZE_NGRAMS enables REGEXP_CONTAINS pattern matching
+                # Note: labels (ARRAY) excluded from STORING - not allowed for array fields
+                """CREATE SEARCH INDEX EntityNodeCustomEntityIndex
+                   ON EntityNode(labels_tokens, name_ngrams_tokens)
+                   STORING (name, summary, attributes)
                    PARTITION BY group_id""",
                 # ============================================================
                 # SECONDARY INDEXES for group_id filtering (Hybrid KNN Strategy)
