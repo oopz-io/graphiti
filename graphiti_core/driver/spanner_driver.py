@@ -1519,6 +1519,32 @@ class SpannerDriver(GraphDriver):
                    STORING (name, summary, attributes)
                    PARTITION BY group_id""",
                 # ============================================================
+                # GLOBAL SEARCH INDEXES (No Partition - for queries without group_id filter)
+                # ============================================================
+                # These indexes support SEARCH() queries that do NOT include group_id
+                # in the same WHERE clause. Spanner requires partitioned indexes to have
+                # an equality filter on the partition key alongside SEARCH().
+                #
+                # Use case: Subqueries that perform SEARCH() first, then filter by group_id
+                # in an outer query (current code pattern in search_utils.py)
+                #
+                # Naming convention: *_global_search_index
+                """CREATE SEARCH INDEX EntityNode_global_search_index
+                   ON EntityNode(name_tokens, summary_tokens)
+                   STORING (name, summary, attributes, created_at, group_id)""",
+                """CREATE SEARCH INDEX EntityEdge_global_search_index
+                   ON EntityEdge(name_tokens, fact_tokens)
+                   STORING (name, fact, source_node_uuid, target_node_uuid, created_at, expired_at, valid_at, invalid_at, group_id)""",
+                """CREATE SEARCH INDEX EpisodicNode_global_search_index
+                   ON EpisodicNode(content_tokens, source_tokens, source_description_tokens)
+                   STORING (name, source, source_description, content, created_at, valid_at, group_id)""",
+                """CREATE SEARCH INDEX CommunityNode_global_search_index
+                   ON CommunityNode(name_tokens)
+                   STORING (name, summary, created_at, group_id)""",
+                """CREATE SEARCH INDEX ContradictedEdge_global_search_index
+                   ON ContradictedEdge(invalidated_fact_tokens, invalidating_fact_tokens)
+                   STORING (invalidated_edge_uuid, invalidating_edge_uuid, invalidated_fact, invalidating_fact, invalidated_at, created_at, group_id)""",
+                # ============================================================
                 # SECONDARY INDEXES for group_id filtering (Hybrid KNN Strategy)
                 # ============================================================
                 # These indexes are CRITICAL for the Hybrid KNN (Exact K-Nearest Neighbors)
