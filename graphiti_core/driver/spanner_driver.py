@@ -62,6 +62,47 @@ SPANNER_SESSION_POOL_CONFIG = {
     'log_exhaustion_as_warning': False,  # Set to True to log pool exhaustion as WARNING
 }
 
+# Table name mapping from user tables to Common tables
+# Used when use_common_tables=True to route data to Common* tables
+USER_TO_COMMON_TABLE_MAPPING = {
+    'EntityNode': 'CommonEntityNode',
+    'EntityEdge': 'CommonEntityEdge',
+    'EpisodicNode': 'CommonEpisodicNode',
+    'EpisodicEdge': 'CommonEpisodicEdge',
+    'CommunityNode': 'CommonCommunityNode',
+    'ContradictedEdge': 'CommonContradictedEdge',
+    # Also map the property graph name
+    'GRAPHITI': 'COMMON_GRAPHITI',
+}
+
+
+def _rewrite_query_for_common_tables(query: str) -> str:
+    """
+    Rewrite a SQL query to use Common* tables instead of user tables.
+
+    This performs a simple string replacement of table names. The replacements
+    are done in order of longest match first to avoid partial replacements.
+
+    Args:
+        query: The original SQL query with user table names
+
+    Returns:
+        The query with table names replaced to Common* versions
+    """
+    result = query
+    # Sort by length descending to replace longer names first
+    # This prevents 'EntityNode' from being replaced before 'CommonEntityNode' check
+    for user_table, common_table in sorted(
+        USER_TO_COMMON_TABLE_MAPPING.items(), key=lambda x: len(x[0]), reverse=True
+    ):
+        # Only replace if not already a Common table
+        # Use word boundaries to avoid partial matches
+        import re
+        # Match table name that is not preceded by 'Common'
+        pattern = rf'(?<!Common){user_table}\b'
+        result = re.sub(pattern, common_table, result)
+    return result
+
 
 def _parse_insert_or_update_query(
     query: str, params: dict[str, Any]
@@ -1114,6 +1155,17 @@ class SpannerDriver(GraphDriver):
     - Full-text search indexes for content search
     - Property graph definition for graph query support
 
+    Common Tables (Optional, enabled by default):
+    ---------------------------------------------
+    When enable_common_tables=True, additional tables are created for storing
+    shared/common knowledge separate from user-specific data:
+
+    - CommonEntityNode, CommonEntityEdge, CommonEpisodicNode, etc.
+    - COMMON_GRAPHITI property graph for graph queries on common data
+    
+    This separation provides better isolation between user and common data,
+    independent scaling, and cleaner data management.
+
     Schema Initialization:
     ----------------------
     The driver supports two modes for schema initialization:
@@ -1133,10 +1185,18 @@ class SpannerDriver(GraphDriver):
     For optimal performance with pre-warmed session pool, use the async
     factory method `create()` instead of direct instantiation:
 
-        # Development/testing with automatic schema setup
+        # Development/testing with automatic schema setup (includes Common tables)
         driver = await SpannerDriver.create(
             project_id, instance_id, database_id,
-            ensure_schema=True
+            ensure_schema=True,
+            enable_common_tables=True  # default
+        )
+
+        # Production without Common tables
+        driver = await SpannerDriver.create(
+            project_id, instance_id, database_id,
+            ensure_schema=True,
+            enable_common_tables=False
         )
 
         # Production with manual schema control
@@ -1161,6 +1221,8 @@ class SpannerDriver(GraphDriver):
         credentials: Any = None,
         session_pool_size: int | None = None,
         ensure_schema: bool = False,
+        enable_common_tables: bool = True,
+        use_common_tables: bool = False,
     ):
         """Initialize the Spanner driver.
 
@@ -1180,6 +1242,15 @@ class SpannerDriver(GraphDriver):
                          If False (default), schema initialization is skipped entirely.
                          This parameter only takes effect when using create(), not the constructor.
                          Set to True if you want automatic schema setup.
+            enable_common_tables: If True (default), create Common* tables for shared/common
+                                knowledge storage (CommonEntityNode, CommonEntityEdge, etc.)
+                                and the COMMON_GRAPHITI property graph.
+                                If False, only user-specific tables are created.
+            use_common_tables: If True, route all data operations (INSERT/UPDATE/SELECT) to
+                             Common* tables (CommonEntityNode, CommonEntityEdge, etc.) instead
+                             of the standard user tables. This is used for "common" mode where
+                             shared knowledge is stored separately from user-specific data.
+                             If False (default), use standard user tables.
         """
         super().__init__()
 
@@ -1215,6 +1286,18 @@ class SpannerDriver(GraphDriver):
         self._ensure_schema_flag = ensure_schema
         self._schema_initialized = False
 
+        # Store the common tables flag
+        # If True, Common* tables and COMMON_GRAPHITI property graph will be created
+        # If use_common_tables is True, we need Common* schema to exist
+        if use_common_tables and not enable_common_tables:
+            logger.info('[SPANNER DRIVER] use_common_tables=True implies enable_common_tables=True')
+            enable_common_tables = True
+        self._enable_common_tables = enable_common_tables
+
+        # Store the use_common_tables flag
+        # If True, route all data operations to Common* tables instead of user tables
+        self._use_common_tables = use_common_tables
+
         # Flag to track if session pool has been pre-warmed
         self._pool_initialized = False
 
@@ -1227,6 +1310,8 @@ class SpannerDriver(GraphDriver):
         credentials: Any = None,
         session_pool_size: int | None = None,
         ensure_schema: bool = False,
+        enable_common_tables: bool = True,
+        use_common_tables: bool = False,
     ) -> 'SpannerDriver':
         """Async factory method to create a SpannerDriver with pre-warmed session pool.
 
@@ -1242,6 +1327,14 @@ class SpannerDriver(GraphDriver):
                 ensure_schema=True  # Automatically set up database schema
             )
 
+            # For "common" mode - store data in Common* tables
+            driver = await SpannerDriver.create(
+                project_id='my-project',
+                instance_id='my-instance',
+                database_id='my-database',
+                use_common_tables=True  # Route data to Common* tables
+            )
+
         Args:
             project_id: The GCP project ID
             instance_id: The Spanner instance ID
@@ -1251,12 +1344,26 @@ class SpannerDriver(GraphDriver):
                              Defaults to SPANNER_SESSION_POOL_CONFIG['max_size'] (50).
             ensure_schema: If True, initialize the database schema during driver creation.
                          If False (default), schema initialization is skipped entirely.
+            enable_common_tables: If True (default), Common* tables and COMMON_GRAPHITI
+                                property graph will be created when schema is initialized.
+                                If False, only the standard user tables are created.
+            use_common_tables: If True, route all data operations to Common* tables
+                             (CommonEntityNode, CommonEntityEdge, etc.) instead of
+                             standard user tables. Use this for "common" mode storage.
+                             If False (default), use standard user tables.
 
         Returns:
             SpannerDriver instance with pre-warmed session pool
         """
+        # If use_common_tables is True, we need the Common* schema to exist
+        # So automatically enable common tables schema creation
+        if use_common_tables and not enable_common_tables:
+            logger.info('[SPANNER DRIVER] use_common_tables=True implies enable_common_tables=True')
+            enable_common_tables = True
+        
         driver = cls(
-            project_id, instance_id, database_id, credentials, session_pool_size, ensure_schema
+            project_id, instance_id, database_id, credentials, session_pool_size, ensure_schema,
+            enable_common_tables, use_common_tables
         )
         await driver._ensure_pool_initialized()
 
@@ -1624,6 +1731,203 @@ class SpannerDriver(GraphDriver):
                 """CREATE INDEX EpisodicEdge_group_source_idx ON EpisodicEdge(group_id, source_node_uuid)""",
             ]
 
+            # ============================================================
+            # COMMON TABLES (for shared/common group_id storage)
+            # ============================================================
+            # These tables mirror the user-specific tables but are dedicated to
+            # storing "common" knowledge that is shared across all users.
+            # This separation provides:
+            # - Better isolation between user and common data
+            # - Independent scaling and performance optimization
+            # - Cleaner data management and potential different retention policies
+            #
+            # Only created when enable_common_tables=True (default)
+            common_schema_statements = [
+                # Create sequences for Common tables
+                """CREATE SEQUENCE CommonEntityNodeSequence OPTIONS (
+                    sequence_kind='bit_reversed_positive'
+                )""",
+                """CREATE SEQUENCE CommonEntityEdgeSequence OPTIONS (
+                    sequence_kind='bit_reversed_positive'
+                )""",
+                """CREATE SEQUENCE CommonEpisodicNodeSequence OPTIONS (
+                    sequence_kind='bit_reversed_positive'
+                )""",
+                """CREATE SEQUENCE CommonCommunityNodeSequence OPTIONS (
+                    sequence_kind='bit_reversed_positive'
+                )""",
+                """CREATE SEQUENCE CommonEpisodicEdgeSequence OPTIONS (
+                    sequence_kind='bit_reversed_positive'
+                )""",
+                """CREATE SEQUENCE CommonContradictedEdgeSequence OPTIONS (
+                    sequence_kind='bit_reversed_positive'
+                )""",
+                # Common Entity Node table
+                """CREATE TABLE CommonEntityNode (
+                  id INT64 DEFAULT (GET_NEXT_SEQUENCE_VALUE(SEQUENCE CommonEntityNodeSequence)),
+                  uuid STRING(256),
+                  name STRING(MAX),
+                  group_id STRING(256),
+                  labels ARRAY<STRING(256)>,
+                  created_at TIMESTAMP NOT NULL,
+                  name_embedding ARRAY<FLOAT64>(vector_length=>768),
+                  summary STRING(MAX),
+                  attributes JSON,
+                  name_tokens TOKENLIST AS (TOKENIZE_FULLTEXT(name)) HIDDEN,
+                  summary_tokens TOKENLIST AS (TOKENIZE_FULLTEXT(summary)) HIDDEN,
+                  labels_tokens TOKENLIST AS (TOKEN(labels)) HIDDEN,
+                  name_ngrams_tokens TOKENLIST AS (TOKENIZE_NGRAMS(name, ngram_size_min=>3, ngram_size_max=>4)) HIDDEN
+                ) PRIMARY KEY(uuid)""",
+                # Common Entity Edge table
+                """CREATE TABLE CommonEntityEdge (
+                  id INT64 DEFAULT (GET_NEXT_SEQUENCE_VALUE(SEQUENCE CommonEntityEdgeSequence)),
+                  source_node_uuid STRING(256),
+                  target_node_uuid STRING(256),
+                  labels ARRAY<STRING(256)>,
+                  fact STRING(MAX),
+                  fact_embedding ARRAY<FLOAT64>(vector_length=>768),
+                  uuid STRING(256),
+                  name STRING(MAX),
+                  group_id STRING(256),
+                  episodes ARRAY<STRING(256)>,
+                  created_at TIMESTAMP NOT NULL,
+                  expired_at TIMESTAMP,
+                  valid_at TIMESTAMP,
+                  invalid_at TIMESTAMP,
+                  attributes JSON,
+                  name_tokens TOKENLIST AS (TOKENIZE_FULLTEXT(name)) HIDDEN,
+                  fact_tokens TOKENLIST AS (TOKENIZE_FULLTEXT(fact)) HIDDEN
+                ) PRIMARY KEY(uuid)""",
+                # Common Episodic Node table
+                """CREATE TABLE CommonEpisodicNode (
+                    id INT64 DEFAULT (GET_NEXT_SEQUENCE_VALUE(SEQUENCE CommonEpisodicNodeSequence)),
+                    source STRING(256),
+                    source_description STRING(MAX),
+                    content STRING(MAX),
+                    entity_edges ARRAY<STRING(MAX)>,
+                    uuid STRING(256),
+                    name STRING(MAX),
+                    group_id STRING(256),
+                    created_at TIMESTAMP NOT NULL,
+                    valid_at TIMESTAMP NOT NULL,
+                    content_tokens TOKENLIST AS (TOKENIZE_FULLTEXT(content)) HIDDEN,
+                    source_tokens TOKENLIST AS (TOKENIZE_FULLTEXT(source)) HIDDEN,
+                    source_description_tokens TOKENLIST AS (TOKENIZE_FULLTEXT(source_description)) HIDDEN
+                ) PRIMARY KEY(uuid)""",
+                # Common Community Node table
+                """CREATE TABLE CommonCommunityNode (
+                    id INT64 DEFAULT (GET_NEXT_SEQUENCE_VALUE(SEQUENCE CommonCommunityNodeSequence)),
+                    uuid STRING(256),
+                    name STRING(MAX),
+                    name_embedding ARRAY<FLOAT64>(vector_length=>768),
+                    group_id STRING(256),
+                    created_at TIMESTAMP NOT NULL,
+                    summary STRING(MAX),
+                    labels ARRAY<STRING(256)>,
+                    name_tokens TOKENLIST AS (TOKENIZE_FULLTEXT(name)) HIDDEN
+                ) PRIMARY KEY(uuid)""",
+                # Common Episodic Edge table
+                """CREATE TABLE CommonEpisodicEdge (
+                  id INT64 DEFAULT (GET_NEXT_SEQUENCE_VALUE(SEQUENCE CommonEpisodicEdgeSequence)),
+                  source_node_uuid STRING(256),
+                  target_node_uuid STRING(256),
+                  uuid STRING(256),
+                  name STRING(MAX),
+                  group_id STRING(256),
+                  created_at TIMESTAMP NOT NULL
+                ) PRIMARY KEY(uuid)""",
+                # Common Contradicted Edge table
+                """CREATE TABLE CommonContradictedEdge (
+                  id INT64 DEFAULT (GET_NEXT_SEQUENCE_VALUE(SEQUENCE CommonContradictedEdgeSequence)),
+                  uuid STRING(256),
+                  invalidated_edge_uuid STRING(256),
+                  invalidating_edge_uuid STRING(256),
+                  invalidated_fact STRING(MAX),
+                  invalidating_fact STRING(MAX),
+                  invalidated_at TIMESTAMP NOT NULL,
+                  group_id STRING(256),
+                  invalidated_edge_data JSON,
+                  invalidating_edge_data JSON,
+                  created_at TIMESTAMP NOT NULL,
+                  invalidated_fact_tokens TOKENLIST AS (TOKENIZE_FULLTEXT(invalidated_fact)) HIDDEN,
+                  invalidating_fact_tokens TOKENLIST AS (TOKENIZE_FULLTEXT(invalidating_fact)) HIDDEN
+                ) PRIMARY KEY(uuid)""",
+                # ============================================================
+                # COMMON SEARCH INDEXES (Full-Text Search with Partition Isolation)
+                # ============================================================
+                """CREATE SEARCH INDEX CommonEntityNode_search_index
+                   ON CommonEntityNode(name_tokens, summary_tokens, labels_tokens, name_ngrams_tokens)
+                   STORING (name, summary, attributes, created_at)
+                   PARTITION BY group_id""",
+                """CREATE SEARCH INDEX CommonEntityEdge_search_index
+                   ON CommonEntityEdge(name_tokens, fact_tokens)
+                   STORING (name, fact, source_node_uuid, target_node_uuid, created_at, expired_at, valid_at, invalid_at)
+                   PARTITION BY group_id""",
+                """CREATE SEARCH INDEX CommonEpisodicNode_search_index
+                   ON CommonEpisodicNode(content_tokens, source_tokens, source_description_tokens)
+                   STORING (name, source, source_description, content, created_at, valid_at)
+                   PARTITION BY group_id""",
+                """CREATE SEARCH INDEX CommonCommunityNode_search_index
+                   ON CommonCommunityNode(name_tokens)
+                   STORING (name, summary, created_at)
+                   PARTITION BY group_id""",
+                """CREATE SEARCH INDEX CommonContradictedEdge_search_index
+                   ON CommonContradictedEdge(invalidated_fact_tokens, invalidating_fact_tokens)
+                   STORING (invalidated_edge_uuid, invalidating_edge_uuid, invalidated_fact, invalidating_fact, invalidated_at, created_at)
+                   PARTITION BY group_id""",
+                # Custom Entity Index for Common tables
+                """CREATE SEARCH INDEX CommonEntityNodeCustomEntityIndex
+                   ON CommonEntityNode(labels_tokens, name_ngrams_tokens)
+                   STORING (name, summary, attributes)
+                   PARTITION BY group_id""",
+                # ============================================================
+                # COMMON GLOBAL SEARCH INDEXES (No Partition)
+                # ============================================================
+                """CREATE SEARCH INDEX CommonEntityNode_global_search_index
+                   ON CommonEntityNode(name_tokens, summary_tokens)
+                   STORING (name, summary, attributes, created_at, group_id)""",
+                """CREATE SEARCH INDEX CommonEntityEdge_global_search_index
+                   ON CommonEntityEdge(name_tokens, fact_tokens)
+                   STORING (name, fact, source_node_uuid, target_node_uuid, created_at, expired_at, valid_at, invalid_at, group_id)""",
+                """CREATE SEARCH INDEX CommonEpisodicNode_global_search_index
+                   ON CommonEpisodicNode(content_tokens, source_tokens, source_description_tokens)
+                   STORING (name, source, source_description, content, created_at, valid_at, group_id)""",
+                """CREATE SEARCH INDEX CommonCommunityNode_global_search_index
+                   ON CommonCommunityNode(name_tokens)
+                   STORING (name, summary, created_at, group_id)""",
+                """CREATE SEARCH INDEX CommonContradictedEdge_global_search_index
+                   ON CommonContradictedEdge(invalidated_fact_tokens, invalidating_fact_tokens)
+                   STORING (invalidated_edge_uuid, invalidating_edge_uuid, invalidated_fact, invalidating_fact, invalidated_at, created_at, group_id)""",
+                # ============================================================
+                # COMMON SECONDARY INDEXES for group_id filtering
+                # ============================================================
+                """CREATE INDEX CommonEpisodicNode_group_id_idx ON CommonEpisodicNode(group_id)""",
+                """CREATE INDEX CommonEntityNode_group_id_idx ON CommonEntityNode(group_id)""",
+                """CREATE INDEX CommonEntityEdge_group_id_idx ON CommonEntityEdge(group_id)""",
+                """CREATE INDEX CommonEpisodicEdge_group_id_idx ON CommonEpisodicEdge(group_id)""",
+                """CREATE INDEX CommonCommunityNode_group_id_idx ON CommonCommunityNode(group_id)""",
+                """CREATE INDEX CommonContradictedEdge_group_id_idx ON CommonContradictedEdge(group_id)""",
+                # ============================================================
+                # COMMON GRAPH TRAVERSAL INDEXES
+                # ============================================================
+                """CREATE INDEX CommonEntityEdge_source_node_idx ON CommonEntityEdge(source_node_uuid)""",
+                """CREATE INDEX CommonEntityEdge_target_node_idx ON CommonEntityEdge(target_node_uuid)""",
+                """CREATE INDEX CommonEpisodicEdge_source_node_idx ON CommonEpisodicEdge(source_node_uuid)""",
+                """CREATE INDEX CommonEpisodicEdge_target_node_idx ON CommonEpisodicEdge(target_node_uuid)""",
+                # ============================================================
+                # COMMON COMPOSITE INDEXES (group_id + graph traversal)
+                # ============================================================
+                """CREATE INDEX CommonEntityEdge_group_source_idx ON CommonEntityEdge(group_id, source_node_uuid)""",
+                """CREATE INDEX CommonEpisodicEdge_group_source_idx ON CommonEpisodicEdge(group_id, source_node_uuid)""",
+            ]
+
+            # Conditionally include Common* schema statements
+            if self._enable_common_tables:
+                schema_statements.extend(common_schema_statements)
+                logger.info('Common tables feature enabled - will create Common* schema elements')
+            else:
+                logger.info('Common tables feature disabled - skipping Common* schema elements')
+
             # Property graph definition - created separately to handle partial schema scenarios
             property_graph_statement = """CREATE PROPERTY GRAPH GRAPHITI
                   NODE TABLES(
@@ -1663,6 +1967,45 @@ class SpannerDriver(GraphDriver):
                         id, source_node_uuid, target_node_uuid, labels, fact, fact_embedding, uuid, name, group_id, episodes, created_at, expired_at, valid_at, invalid_at, attributes)
                   )"""
 
+            # Property graph definition for Common tables - separate graph for shared knowledge
+            common_property_graph_statement = """CREATE PROPERTY GRAPH COMMON_GRAPHITI
+                  NODE TABLES(
+                    CommonEntityNode
+                      KEY (uuid)
+                      LABEL Entity
+                      PROPERTIES (
+                         id, uuid, name, group_id, labels, created_at, name_embedding, summary, attributes
+                      ),
+                     CommonEpisodicNode
+                      KEY (uuid)
+                      LABEL Episodic
+                      PROPERTIES (
+                        id, source, source_description, content, entity_edges, uuid, name, group_id, created_at, valid_at),
+                    CommonCommunityNode
+                      KEY (uuid)
+                      LABEL Community
+                      PROPERTIES (
+                        id, uuid, name, name_embedding, group_id, created_at, summary, labels
+                      )
+                  )
+                  EDGE TABLES ( 
+                      CommonEpisodicEdge
+                      KEY (uuid)
+                      SOURCE KEY (source_node_uuid) REFERENCES CommonEpisodicNode (uuid)
+                      DESTINATION KEY (target_node_uuid) REFERENCES CommonEntityNode (uuid)
+                      LABEL MENTIONS
+                      PROPERTIES (
+                        id, source_node_uuid, target_node_uuid, uuid, name, group_id, created_at
+                      ),
+                      CommonEntityEdge
+                      KEY (uuid)
+                      SOURCE KEY (source_node_uuid) REFERENCES CommonEntityNode (uuid)
+                      DESTINATION KEY (target_node_uuid) REFERENCES CommonEntityNode (uuid)
+                      LABEL RELATES_TO
+                      PROPERTIES (
+                        id, source_node_uuid, target_node_uuid, labels, fact, fact_embedding, uuid, name, group_id, episodes, created_at, expired_at, valid_at, invalid_at, attributes)
+                  )"""
+
             # Execute DDL statements to create schema (tables, sequences, indexes)
             # Execute them individually to handle partial schema scenarios
             for statement in schema_statements:
@@ -1682,15 +2025,29 @@ class SpannerDriver(GraphDriver):
             # Execute property graph creation separately
             try:
                 await self.execute_ddl([property_graph_statement])
-                logger.info('Property graph created successfully')
+                logger.info('Property graph GRAPHITI created successfully')
             except Exception as e:
                 # Check if error is about duplicate/existing property graph
                 error_str = str(e).lower()
                 if 'duplicate' in error_str or 'already exists' in error_str:
-                    logger.info('Property graph already exists')
+                    logger.info('Property graph GRAPHITI already exists')
                 else:
-                    logger.error(f'Error creating property graph: {e}')
+                    logger.error(f'Error creating property graph GRAPHITI: {e}')
                     raise
+
+            # Execute Common property graph creation separately (only if enabled)
+            if self._enable_common_tables:
+                try:
+                    await self.execute_ddl([common_property_graph_statement])
+                    logger.info('Property graph COMMON_GRAPHITI created successfully')
+                except Exception as e:
+                    # Check if error is about duplicate/existing property graph
+                    error_str = str(e).lower()
+                    if 'duplicate' in error_str or 'already exists' in error_str:
+                        logger.info('Property graph COMMON_GRAPHITI already exists')
+                    else:
+                        logger.error(f'Error creating property graph COMMON_GRAPHITI: {e}')
+                        raise
 
         except Exception as e:
             # Check if error is about duplicate/existing schema objects
@@ -1721,15 +2078,29 @@ class SpannerDriver(GraphDriver):
             )
             # Reset the flag so schema can be recreated
             self._schema_initialized = False
-            await self.initialize_schema()
+        
+        # Always ensure schema is initialized (idempotent - skips if already done)
+        await self.initialize_schema()
 
     async def execute_query(
         self, cypher_query_: LiteralString, **kwargs: Any
     ) -> tuple[list[dict[str, Any]], None, None]:
-        """Execute a query directly without session management."""
+        """Execute a query directly without session management.
+        
+        If use_common_tables=True was set during driver creation, this method
+        will automatically rewrite table names in the query to use Common* tables
+        (e.g., EntityNode -> CommonEntityNode).
+        """
         import time
 
         start_time = time.perf_counter()
+
+        # Rewrite query to use Common* tables if enabled at driver level
+        if self._use_common_tables:
+            original_query = cypher_query_
+            cypher_query_ = _rewrite_query_for_common_tables(cypher_query_)  # type: ignore
+            if original_query != cypher_query_:
+                logger.debug(f'[COMMON_TABLES] Rewrote query to use Common* tables')
 
         # Acquire a session from the pool
         session_start = time.perf_counter()
