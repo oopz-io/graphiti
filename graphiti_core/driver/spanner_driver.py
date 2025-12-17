@@ -1729,6 +1729,14 @@ class SpannerDriver(GraphDriver):
                 # Example: MATCH (e:Episodic)-[]->(:Entity) WHERE e.group_id = 'user_123'
                 """CREATE INDEX EntityEdge_group_source_idx ON EntityEdge(group_id, source_node_uuid)""",
                 """CREATE INDEX EpisodicEdge_group_source_idx ON EpisodicEdge(group_id, source_node_uuid)""",
+                # ============================================================
+                # EDGE PAIR LOOKUP INDEX (source + target for get_between_nodes)
+                # ============================================================
+                # Optimizes batch lookups of edges between specific node pairs.
+                # Used by get_between_nodes_batch() which looks up edges given
+                # (source_node_uuid, target_node_uuid) pairs.
+                # Example: SELECT * FROM EntityEdge WHERE source_node_uuid = X AND target_node_uuid = Y
+                """CREATE INDEX EntityEdge_source_target_idx ON EntityEdge(source_node_uuid, target_node_uuid)""",
             ]
 
             # ============================================================
@@ -1919,6 +1927,10 @@ class SpannerDriver(GraphDriver):
                 # ============================================================
                 """CREATE INDEX CommonEntityEdge_group_source_idx ON CommonEntityEdge(group_id, source_node_uuid)""",
                 """CREATE INDEX CommonEpisodicEdge_group_source_idx ON CommonEpisodicEdge(group_id, source_node_uuid)""",
+                # ============================================================
+                # COMMON EDGE PAIR LOOKUP INDEX (source + target for get_between_nodes)
+                # ============================================================
+                """CREATE INDEX CommonEntityEdge_source_target_idx ON CommonEntityEdge(source_node_uuid, target_node_uuid)""",
             ]
 
             # Conditionally include Common* schema statements
@@ -2057,6 +2069,47 @@ class SpannerDriver(GraphDriver):
             else:
                 logger.error(f'Error initializing schema: {e}')
                 raise
+        
+        # Ensure all required indexes exist (idempotent - skips existing ones)
+        await self.ensure_indexes()
+
+    async def ensure_indexes(self) -> None:
+        """
+        Ensure all required indexes exist in the database.
+        
+        This method can be called on existing databases to add new indexes
+        that were added after the initial schema creation. It's idempotent -
+        indexes that already exist will be skipped.
+        
+        Use this when you've upgraded graphiti and need to add new indexes
+        without recreating the entire schema.
+        """
+        # List of indexes that should exist
+        indexes_to_ensure = [
+            # Edge pair lookup index - optimizes get_between_nodes_batch
+            """CREATE INDEX EntityEdge_source_target_idx ON EntityEdge(source_node_uuid, target_node_uuid)""",
+        ]
+        
+        # Add Common table indexes if enabled
+        if self._enable_common_tables:
+            indexes_to_ensure.append(
+                """CREATE INDEX CommonEntityEdge_source_target_idx ON CommonEntityEdge(source_node_uuid, target_node_uuid)"""
+            )
+        
+        for index_stmt in indexes_to_ensure:
+            try:
+                await self.execute_ddl([index_stmt])
+                # Extract index name for logging
+                index_name = index_stmt.split('INDEX ')[1].split(' ON')[0]
+                logger.info(f'Index {index_name} created successfully')
+            except Exception as e:
+                error_str = str(e).lower()
+                if 'duplicate' in error_str or 'already exists' in error_str:
+                    index_name = index_stmt.split('INDEX ')[1].split(' ON')[0]
+                    logger.debug(f'Index {index_name} already exists')
+                else:
+                    logger.error(f'Error creating index: {e}')
+                    raise
 
     async def build_indices_and_constraints(self, delete_existing: bool = False) -> None:
         """
@@ -2092,6 +2145,17 @@ class SpannerDriver(GraphDriver):
         (e.g., EntityNode -> CommonEntityNode).
         """
         import time
+
+        # Import profiler (conditional to avoid circular imports)
+        try:
+            from graphiti_core.utils.query_profiler import (
+                is_profiling_enabled,
+                record_query,
+                classify_query,
+            )
+            profiler_available = True
+        except ImportError:
+            profiler_available = False
 
         start_time = time.perf_counter()
 
@@ -2356,6 +2420,21 @@ class SpannerDriver(GraphDriver):
                             f'Retrying in {delay:.2f}s. Error: {str(e)[:200]}'
                         )
                         await asyncio.sleep(delay)
+
+            # Record query for profiling if enabled
+            if profiler_available and is_profiling_enabled():
+                query_time_ms = (time.perf_counter() - start_time) * 1000
+                operation, query_type, table = classify_query(cypher_query_)
+                record_query(
+                    operation=operation,
+                    query_type=query_type,
+                    table_or_index=table,
+                    duration_ms=query_time_ms,
+                    rows_returned=len(rows),
+                    query_text=cypher_query_,
+                    params=kwargs,
+                    caller='execute_query',
+                )
 
             return rows, None, None
 

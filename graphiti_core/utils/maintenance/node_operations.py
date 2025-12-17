@@ -42,6 +42,7 @@ from graphiti_core.search.search import search
 from graphiti_core.search.search_config import SearchResults
 from graphiti_core.search.search_config_recipes import NODE_HYBRID_SEARCH_RRF
 from graphiti_core.search.search_filters import SearchFilters
+from graphiti_core.search.search_utils import node_fulltext_search_batch
 from graphiti_core.utils.datetime_utils import utc_now
 from graphiti_core.utils.maintenance.dedup_helpers import (
     DedupCandidateIndexes,
@@ -214,21 +215,58 @@ async def _collect_candidate_nodes(
     extracted_nodes: list[EntityNode],
     existing_nodes_override: list[EntityNode] | None,
 ) -> list[EntityNode]:
-    """Search per extracted name and return unique candidates with overrides honored in order."""
-    search_results: list[SearchResults] = await semaphore_gather(
-        *[
-            search(
-                clients=clients,
-                query=node.name,
-                group_ids=[node.group_id],
-                search_filter=SearchFilters(),
-                config=NODE_HYBRID_SEARCH_RRF,
+    """Search per extracted name and return unique candidates with overrides honored in order.
+    
+    OPTIMIZATION: Uses batched fulltext search on Spanner to reduce N queries to 1 query.
+    This significantly reduces CPU usage when there are many extracted nodes.
+    """
+    from graphiti_core.driver.driver import GraphProvider
+    
+    driver = clients.driver
+    
+    # OPTIMIZATION: Use batched search for Spanner to reduce N queries to 1
+    if driver.provider == GraphProvider.SPANNER and len(extracted_nodes) > 1:
+        # Group nodes by group_id (usually all same group)
+        nodes_by_group: dict[str, list[EntityNode]] = {}
+        for node in extracted_nodes:
+            if node.group_id not in nodes_by_group:
+                nodes_by_group[node.group_id] = []
+            nodes_by_group[node.group_id].append(node)
+        
+        # Perform batched search for each group
+        all_candidate_nodes: list[EntityNode] = []
+        for group_id, group_nodes in nodes_by_group.items():
+            node_names = [node.name for node in group_nodes]
+            
+            # Use batched fulltext search - 1 query instead of N queries
+            batch_results = await node_fulltext_search_batch(
+                driver=driver,
+                queries=node_names,
+                group_ids=[group_id],
+                limit_per_query=5,  # ~5 candidates per node name
             )
-            for node in extracted_nodes
-        ]
-    )
-
-    candidate_nodes: list[EntityNode] = [node for result in search_results for node in result.nodes]
+            all_candidate_nodes.extend(batch_results)
+        
+        candidate_nodes = all_candidate_nodes
+        logger.debug(
+            f'[BATCH_SEARCH] _collect_candidate_nodes: batched {len(extracted_nodes)} nodes -> '
+            f'{len(candidate_nodes)} candidates'
+        )
+    else:
+        # Original behavior for non-Spanner or single node
+        search_results: list[SearchResults] = await semaphore_gather(
+            *[
+                search(
+                    clients=clients,
+                    query=node.name,
+                    group_ids=[node.group_id],
+                    search_filter=SearchFilters(),
+                    config=NODE_HYBRID_SEARCH_RRF,
+                )
+                for node in extracted_nodes
+            ]
+        )
+        candidate_nodes = [node for result in search_results for node in result.nodes]
 
     if existing_nodes_override is not None:
         candidate_nodes.extend(existing_nodes_override)

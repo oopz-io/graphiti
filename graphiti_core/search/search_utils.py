@@ -291,14 +291,8 @@ async def edge_fulltext_search(
             return []
     elif driver.provider == GraphProvider.SPANNER:
         # Spanner full-text search for edges using SEARCH on tokenlist columns
-        filter_conditions = []
-
-        # Build the WHERE clause with proper group_ids handling
-        if group_ids:
-            group_id_list = ', '.join([f"'{gid}'" for gid in group_ids])
-            filter_conditions.append(f'group_id IN ({group_id_list})')
-
-        # Add label filtering if specified (will be applied in outer query)
+        # Build label filter condition (will be applied in outer query or inline)
+        label_filter = ''
         if search_filter.node_labels:
             label_filter = (
                 'EXISTS (SELECT 1 FROM EntityNode AS node WHERE node.uuid = source_node_uuid AND ('
@@ -307,38 +301,69 @@ async def edge_fulltext_search(
             for label in search_filter.node_labels:
                 label_conditions.append(f"'{label}' IN UNNEST(node.labels)")
             label_filter += ' OR '.join(label_conditions) + '))'
-            filter_conditions.append(label_filter)
 
-        outer_where = ''
-        if filter_conditions:
-            outer_where = 'WHERE ' + ' AND '.join(filter_conditions)
-
-        # Use subquery to keep SEARCH in proper query shape for search index
         inner_limit = limit * 2  # Pre-calculate since Spanner doesn't support expressions in LIMIT
-        spanner_query = f"""
-            SELECT e.uuid, e.name, e.fact, e.group_id, e.created_at, e.expired_at, e.valid_at, e.invalid_at,
-                   e.source_node_uuid, e.target_node_uuid, e.fact_embedding, e.episodes, e.attributes, e.score
-            FROM (
+        
+        # Optimization: When group_ids has EXACTLY ONE value, include it in WHERE with SEARCH()
+        # This allows Spanner to use the PARTITION BY group_id search index (much faster)
+        if group_ids and len(group_ids) == 1:
+            # OPTIMIZED: Single group_id allows partitioned index usage
+            where_conditions = ['group_id = @group_id', '(SEARCH(name_tokens, @query) OR SEARCH(fact_tokens, @query))']
+            if label_filter:
+                where_conditions.append(label_filter)
+            
+            spanner_query = f"""
                 SELECT uuid, name, fact, group_id, created_at, expired_at, valid_at, invalid_at,
                        source_node_uuid, target_node_uuid, fact_embedding, episodes, attributes,
                        COALESCE(SCORE(name_tokens, @query), 0) + COALESCE(SCORE(fact_tokens, @query), 0) as score
                 FROM EntityEdge
-                WHERE SEARCH(name_tokens, @query) OR SEARCH(fact_tokens, @query)
+                WHERE {' AND '.join(where_conditions)}
                 ORDER BY score DESC, uuid
-                LIMIT @inner_limit
-            ) AS e
-            {outer_where}
-            ORDER BY e.score DESC, e.uuid
-            LIMIT @limit
-        """
+                LIMIT @limit
+            """
+            records, _, _ = await driver.execute_query(
+                spanner_query,
+                query=fuzzy_query,
+                group_id=group_ids[0],
+                limit=limit,
+                routing_='r',
+            )
+        else:
+            # Fallback: Multiple group_ids or no group_id - use global index with subquery
+            filter_conditions = []
+            if group_ids:
+                group_id_list = ', '.join([f"'{gid}'" for gid in group_ids])
+                filter_conditions.append(f'group_id IN ({group_id_list})')
+            if label_filter:
+                filter_conditions.append(label_filter)
 
-        records, _, _ = await driver.execute_query(
-            spanner_query,
-            query=fuzzy_query,
-            limit=limit,
-            inner_limit=inner_limit,
-            routing_='r',
-        )
+            outer_where = ''
+            if filter_conditions:
+                outer_where = 'WHERE ' + ' AND '.join(filter_conditions)
+
+            spanner_query = f"""
+                SELECT e.uuid, e.name, e.fact, e.group_id, e.created_at, e.expired_at, e.valid_at, e.invalid_at,
+                       e.source_node_uuid, e.target_node_uuid, e.fact_embedding, e.episodes, e.attributes, e.score
+                FROM (
+                    SELECT uuid, name, fact, group_id, created_at, expired_at, valid_at, invalid_at,
+                           source_node_uuid, target_node_uuid, fact_embedding, episodes, attributes,
+                           COALESCE(SCORE(name_tokens, @query), 0) + COALESCE(SCORE(fact_tokens, @query), 0) as score
+                    FROM EntityEdge
+                    WHERE SEARCH(name_tokens, @query) OR SEARCH(fact_tokens, @query)
+                    ORDER BY score DESC, uuid
+                    LIMIT @inner_limit
+                ) AS e
+                {outer_where}
+                ORDER BY e.score DESC, e.uuid
+                LIMIT @limit
+            """
+            records, _, _ = await driver.execute_query(
+                spanner_query,
+                query=fuzzy_query,
+                limit=limit,
+                inner_limit=inner_limit,
+                routing_='r',
+            )
     else:
         query = (
             get_relationships_query('edge_name_and_fact', limit=limit, provider=driver.provider)
@@ -366,6 +391,142 @@ async def edge_fulltext_search(
     edges = [get_entity_edge_from_record(record, driver.provider) for record in records]
 
     return edges
+
+
+async def edge_fulltext_search_batch(
+    driver: GraphDriver,
+    queries: list[str],
+    group_ids: list[str] | None = None,
+    limit_per_query: int = 5,
+) -> list[EntityEdge]:
+    """
+    Batch search for multiple edge facts in a single query.
+    
+    This is an optimization that reduces N separate fulltext searches into a single query
+    by combining all search terms with OR. This significantly reduces CPU usage on Spanner.
+    
+    Args:
+        driver: Graph database driver
+        queries: List of search terms (e.g., edge facts to search for)
+        group_ids: Optional list of group IDs to filter by
+        limit_per_query: Approximate number of results per query term
+        
+    Returns:
+        List of EntityEdge matching any of the search terms
+    """
+    if not queries:
+        return []
+    
+    # Filter out empty queries and deduplicate
+    clean_queries = list(set(q.strip() for q in queries if q and q.strip()))
+    if not clean_queries:
+        return []
+    
+    # Calculate total limit based on number of queries
+    total_limit = min(len(clean_queries) * limit_per_query, 100)  # Cap at 100
+    
+    if driver.provider == GraphProvider.SPANNER:
+        # Build combined query with OR
+        escaped_queries = []
+        for q in clean_queries:
+            escaped = q.replace('"', '\\"')
+            # Truncate long queries to avoid issues
+            if len(escaped) > 100:
+                escaped = escaped[:100]
+            if ' ' in escaped:
+                escaped_queries.append(f'"{escaped}"')
+            else:
+                escaped_queries.append(escaped)
+        
+        combined_query = ' OR '.join(escaped_queries)
+        
+        # Optimization: When group_ids has EXACTLY ONE value, include it in WHERE with SEARCH()
+        # This allows Spanner to use the PARTITION BY group_id search index (much faster)
+        if group_ids and len(group_ids) == 1:
+            # OPTIMIZED: Single group_id allows partitioned index usage
+            spanner_query = """
+                SELECT uuid, name, fact, group_id, created_at, expired_at, valid_at, invalid_at,
+                       source_node_uuid, target_node_uuid, fact_embedding, episodes, attributes, labels,
+                       COALESCE(SCORE(name_tokens, @query), 0) + COALESCE(SCORE(fact_tokens, @query), 0) as score
+                FROM EntityEdge
+                WHERE group_id = @group_id
+                  AND (SEARCH(name_tokens, @query) OR SEARCH(fact_tokens, @query))
+                ORDER BY score DESC, uuid
+                LIMIT @limit
+            """
+            records, _, _ = await driver.execute_query(
+                spanner_query,
+                query=combined_query,
+                group_id=group_ids[0],
+                limit=total_limit,
+                routing_='r',
+            )
+        else:
+            # Fallback: Multiple group_ids or no group_id - use global index with subquery
+            filter_conditions = []
+            if group_ids:
+                group_id_list = ', '.join([f"'{gid}'" for gid in group_ids])
+                filter_conditions.append(f'group_id IN ({group_id_list})')
+            
+            outer_where = ''
+            if filter_conditions:
+                outer_where = 'WHERE ' + ' AND '.join(filter_conditions)
+            
+            inner_limit = total_limit * 2
+            spanner_query = f"""
+                SELECT e.uuid, e.name, e.fact, e.group_id, e.created_at, e.expired_at, e.valid_at, e.invalid_at,
+                       e.source_node_uuid, e.target_node_uuid, e.fact_embedding, e.episodes, e.attributes, e.labels, e.score
+                FROM (
+                    SELECT uuid, name, fact, group_id, created_at, expired_at, valid_at, invalid_at,
+                           source_node_uuid, target_node_uuid, fact_embedding, episodes, attributes, labels,
+                           COALESCE(SCORE(name_tokens, @query), 0) + COALESCE(SCORE(fact_tokens, @query), 0) as score
+                    FROM EntityEdge
+                    WHERE SEARCH(name_tokens, @query) OR SEARCH(fact_tokens, @query)
+                    ORDER BY score DESC, uuid
+                    LIMIT @inner_limit
+                ) AS e
+                {outer_where}
+                ORDER BY e.score DESC, e.uuid
+                LIMIT @limit
+            """
+            records, _, _ = await driver.execute_query(
+                spanner_query,
+                query=combined_query,
+                limit=total_limit,
+                inner_limit=inner_limit,
+                routing_='r',
+            )
+        
+        edges = [get_entity_edge_from_record(record, driver.provider) for record in records]
+        
+        logger.debug(
+            f'[BATCH_SEARCH] edge_fulltext_search_batch: {len(clean_queries)} terms -> {len(edges)} edges'
+        )
+        
+        return edges
+    
+    else:
+        # For non-Spanner providers, fall back to individual searches
+        logger.warning(
+            f'[BATCH_SEARCH] Batched edge search not optimized for provider {driver.provider}'
+        )
+        all_edges: list[EntityEdge] = []
+        seen_uuids: set[str] = set()
+        
+        for query in clean_queries:
+            edges = await edge_fulltext_search(
+                driver=driver,
+                query=query,
+                search_filter=SearchFilters(),
+                group_ids=group_ids,
+                limit=limit_per_query,
+            )
+            for edge in edges:
+                if edge.uuid not in seen_uuids:
+                    seen_uuids.add(edge.uuid)
+                    all_edges.append(edge)
+        
+        return all_edges[:total_limit]
 
 
 async def edge_similarity_search(
@@ -504,10 +665,14 @@ async def edge_similarity_search(
             return entity_edges
         return []
     elif driver.provider == GraphProvider.SPANNER:
-        # Convert filter query to Spanner syntax
+        # Spanner's COSINE_DISTANCE returns DISTANCE (0 = identical, higher = more different)
+        # Convert to similarity: similarity = 1 - distance
+        # Filter by similarity > min_score, which means distance < (1 - min_score)
+        max_distance = 1.0 - min_score
+
+        # Build label filter if specified
         label_filter = ''
         if search_filter.node_labels:
-            # Add label filtering by joining with EntityNode table
             label_filter = (
                 ' AND EXISTS (SELECT 1 FROM EntityNode AS n WHERE n.uuid = e.source_node_uuid AND ('
             )
@@ -516,56 +681,73 @@ async def edge_similarity_search(
                 label_conditions.append(f"'{label}' IN UNNEST(n.labels)")
             label_filter += ' OR '.join(label_conditions) + '))'
 
-        if filter_query:
-            filter_query = filter_query.replace('WHERE', 'AND')
-            # Replace $ with @ and handle IN clauses with UNNEST
-            import re
-
-            # Match patterns like "IN $param" and replace with "IN UNNEST(@param)" (case-insensitive)
-            filter_query = re.sub(
-                r'\bIN\s+\$(\w+)', r'IN UNNEST(@\1)', filter_query, flags=re.IGNORECASE
+        # OPTIMIZATION: Filter by group_id FIRST to use the group_id index
+        # This enables Hybrid KNN - scanning only the partition (300-10K rows)
+        # instead of the entire table (potentially billions of rows)
+        if group_ids and len(group_ids) == 1:
+            # Single group_id: Most efficient - direct index lookup
+            query = f"""
+                SELECT uuid, source_node_uuid, target_node_uuid, group_id, created_at, name, fact,
+                       episodes, expired_at, valid_at, invalid_at, attributes,
+                       (1.0 - COSINE_DISTANCE(fact_embedding, @search_vector)) as score
+                FROM EntityEdge e
+                WHERE group_id = @group_id
+                  AND fact_embedding IS NOT NULL
+                  AND COSINE_DISTANCE(fact_embedding, @search_vector) < @max_distance
+                  {label_filter}
+                ORDER BY COSINE_DISTANCE(fact_embedding, @search_vector) ASC
+                LIMIT @limit
+            """
+            records, _, _ = await driver.execute_query(
+                query,
+                search_vector=search_vector,
+                group_id=group_ids[0],
+                limit=limit,
+                max_distance=max_distance,
+                routing_='r',
             )
-            filter_query = re.sub(r'\bin\s+\$(\w+)', r'IN UNNEST(@\1)', filter_query)
-            # Replace any remaining $ with @
-            filter_query = filter_query.replace('$', '@')
+        elif group_ids and len(group_ids) > 1:
+            # Multiple group_ids: Use IN UNNEST for partition filtering
+            query = f"""
+                SELECT uuid, source_node_uuid, target_node_uuid, group_id, created_at, name, fact,
+                       episodes, expired_at, valid_at, invalid_at, attributes,
+                       (1.0 - COSINE_DISTANCE(fact_embedding, @search_vector)) as score
+                FROM EntityEdge e
+                WHERE group_id IN UNNEST(@group_ids)
+                  AND fact_embedding IS NOT NULL
+                  AND COSINE_DISTANCE(fact_embedding, @search_vector) < @max_distance
+                  {label_filter}
+                ORDER BY COSINE_DISTANCE(fact_embedding, @search_vector) ASC
+                LIMIT @limit
+            """
+            records, _, _ = await driver.execute_query(
+                query,
+                search_vector=search_vector,
+                group_ids=group_ids,
+                limit=limit,
+                max_distance=max_distance,
+                routing_='r',
+            )
         else:
-            filter_query = ''
-
-        # Spanner's COSINE_DISTANCE returns DISTANCE (0 = identical, higher = more different)
-        # Convert to similarity: similarity = 1 - distance
-        # Filter by similarity > min_score, which means distance < (1 - min_score)
-        max_distance = 1.0 - min_score
-
-        query = f"""
-            WITH cosine_distance AS (
-                SELECT id, COSINE_DISTANCE(fact_embedding, @search_vector) as distance 
-                FROM EntityEdge
-            ), 
-            edge AS (
-                SELECT id, uuid, source_node_uuid, target_node_uuid, group_id, created_at, name, fact, 
-                       episodes, expired_at, valid_at, invalid_at, attributes 
-                FROM EntityEdge
+            # No group_id filter - fallback to scanning all (use with caution on large datasets)
+            query = f"""
+                SELECT uuid, source_node_uuid, target_node_uuid, group_id, created_at, name, fact,
+                       episodes, expired_at, valid_at, invalid_at, attributes,
+                       (1.0 - COSINE_DISTANCE(fact_embedding, @search_vector)) as score
+                FROM EntityEdge e
+                WHERE fact_embedding IS NOT NULL
+                  AND COSINE_DISTANCE(fact_embedding, @search_vector) < @max_distance
+                  {label_filter}
+                ORDER BY COSINE_DISTANCE(fact_embedding, @search_vector) ASC
+                LIMIT @limit
+            """
+            records, _, _ = await driver.execute_query(
+                query,
+                search_vector=search_vector,
+                limit=limit,
+                max_distance=max_distance,
+                routing_='r',
             )
-            SELECT e.uuid, e.source_node_uuid, e.target_node_uuid, e.group_id, e.created_at, e.name, e.fact, 
-                   e.episodes, e.expired_at, e.valid_at, e.invalid_at, e.attributes,
-                   (1.0 - c.distance) as score
-            FROM edge e 
-            JOIN cosine_distance c ON c.id = e.id
-            WHERE c.distance < @max_distance
-            {filter_query}
-            {label_filter}
-            ORDER BY c.distance ASC
-            LIMIT @limit
-        """
-
-        records, _, _ = await driver.execute_query(
-            query,
-            search_vector=search_vector,
-            limit=limit,
-            max_distance=max_distance,
-            routing_='r',
-            **filter_params,
-        )
     else:
         query = (
             match_query
@@ -882,30 +1064,51 @@ async def node_fulltext_search(
         if filter_conditions:
             outer_where = 'WHERE ' + ' AND '.join(filter_conditions)
 
-        # Spanner full-text search: Use subquery to first get search results, then filter
-        # This ensures SEARCH remains in the correct query shape for the search index
-        # Reference: https://cloud.google.com/spanner/docs/full-text-search
+        # Spanner full-text search optimization:
+        # When group_ids has EXACTLY ONE value, include it in the WHERE clause WITH SEARCH()
+        # This allows Spanner to use the PARTITION BY group_id search index (much faster)
+        # Reference: https://cloud.google.com/spanner/docs/full-text-search/search-indexes
         inner_limit = limit * 2  # Pre-calculate since Spanner doesn't support expressions in LIMIT
-        spanner_query = f"""
-            SELECT n.uuid, n.name, n.group_id, n.summary, n.created_at, n.name_embedding, n.labels, n.attributes
-            FROM (
+        
+        if group_ids and len(group_ids) == 1:
+            # OPTIMIZED: Single group_id allows partitioned index usage
+            # Include group_id in same WHERE clause as SEARCH for partition pruning
+            spanner_query = f"""
                 SELECT uuid, name, group_id, summary, created_at, name_embedding, labels, attributes
                 FROM EntityNode
-                WHERE SEARCH(name_tokens, @query) OR SEARCH(summary_tokens, @query)
+                WHERE group_id = @group_id
+                  AND (SEARCH(name_tokens, @query) OR SEARCH(summary_tokens, @query))
                 ORDER BY uuid
-                LIMIT @inner_limit
-            ) AS n
-            {outer_where}
-            LIMIT @limit
-        """
-
-        records, _, _ = await driver.execute_query(
-            spanner_query,
-            query=fuzzy_query,
-            limit=limit,
-            inner_limit=inner_limit,
-            routing_='r',
-        )
+                LIMIT @limit
+            """
+            records, _, _ = await driver.execute_query(
+                spanner_query,
+                query=fuzzy_query,
+                group_id=group_ids[0],
+                limit=limit,
+                routing_='r',
+            )
+        else:
+            # Fallback: Multiple group_ids or no group_id - use global index with subquery
+            spanner_query = f"""
+                SELECT n.uuid, n.name, n.group_id, n.summary, n.created_at, n.name_embedding, n.labels, n.attributes
+                FROM (
+                    SELECT uuid, name, group_id, summary, created_at, name_embedding, labels, attributes
+                    FROM EntityNode
+                    WHERE SEARCH(name_tokens, @query) OR SEARCH(summary_tokens, @query)
+                    ORDER BY uuid
+                    LIMIT @inner_limit
+                ) AS n
+                {outer_where}
+                LIMIT @limit
+            """
+            records, _, _ = await driver.execute_query(
+                spanner_query,
+                query=fuzzy_query,
+                limit=limit,
+                inner_limit=inner_limit,
+                routing_='r',
+            )
     else:
         query = (
             get_nodes_query(
@@ -933,6 +1136,143 @@ async def node_fulltext_search(
     nodes = [get_entity_node_from_record(record, driver.provider) for record in records]
 
     return nodes
+
+
+async def node_fulltext_search_batch(
+    driver: GraphDriver,
+    queries: list[str],
+    group_ids: list[str] | None = None,
+    limit_per_query: int = 5,
+) -> list[EntityNode]:
+    """
+    Batch search for multiple node names in a single query.
+    
+    This is an optimization that reduces N separate fulltext searches into a single query
+    by combining all search terms with OR. This significantly reduces CPU usage on Spanner.
+    
+    Args:
+        driver: Graph database driver
+        queries: List of search terms (e.g., node names to search for)
+        group_ids: Optional list of group IDs to filter by
+        limit_per_query: Approximate number of results per query term (total limit = len(queries) * limit_per_query)
+        
+    Returns:
+        List of EntityNode matching any of the search terms
+    """
+    if not queries:
+        return []
+    
+    # Filter out empty queries and deduplicate
+    clean_queries = list(set(q.strip() for q in queries if q and q.strip()))
+    if not clean_queries:
+        return []
+    
+    # Calculate total limit based on number of queries
+    total_limit = min(len(clean_queries) * limit_per_query, 100)  # Cap at 100 to avoid huge result sets
+    
+    if driver.provider == GraphProvider.SPANNER:
+        # Build combined query: "term1" OR "term2" OR "term3"
+        # Escape quotes in query terms and wrap in quotes for exact phrase matching
+        escaped_queries = []
+        for q in clean_queries:
+            # Escape any existing quotes
+            escaped = q.replace('"', '\\"')
+            # Only wrap in quotes if it contains spaces (phrase search)
+            if ' ' in escaped:
+                escaped_queries.append(f'"{escaped}"')
+            else:
+                escaped_queries.append(escaped)
+        
+        combined_query = ' OR '.join(escaped_queries)
+        
+        # Optimization: When group_ids has EXACTLY ONE value, include it in WHERE with SEARCH()
+        # This allows Spanner to use the PARTITION BY group_id search index (much faster)
+        if group_ids and len(group_ids) == 1:
+            # OPTIMIZED: Single group_id allows partitioned index usage
+            spanner_query = """
+                SELECT uuid, name, group_id, summary, created_at, name_embedding, labels, attributes,
+                       COALESCE(SCORE(name_tokens, @query), 0) + COALESCE(SCORE(summary_tokens, @query), 0) as score
+                FROM EntityNode
+                WHERE group_id = @group_id
+                  AND (SEARCH(name_tokens, @query) OR SEARCH(summary_tokens, @query))
+                ORDER BY score DESC, uuid
+                LIMIT @limit
+            """
+            records, _, _ = await driver.execute_query(
+                spanner_query,
+                query=combined_query,
+                group_id=group_ids[0],
+                limit=total_limit,
+                routing_='r',
+            )
+        else:
+            # Fallback: Multiple group_ids or no group_id - use global index with subquery
+            filter_conditions = []
+            if group_ids:
+                group_id_list = ', '.join([f"'{gid}'" for gid in group_ids])
+                filter_conditions.append(f'group_id IN ({group_id_list})')
+            
+            outer_where = ''
+            if filter_conditions:
+                outer_where = 'WHERE ' + ' AND '.join(filter_conditions)
+            
+            inner_limit = total_limit * 2  # Get more from inner query for filtering
+            spanner_query = f"""
+                SELECT n.uuid, n.name, n.group_id, n.summary, n.created_at, n.name_embedding, n.labels, n.attributes,
+                       n.score
+                FROM (
+                    SELECT uuid, name, group_id, summary, created_at, name_embedding, labels, attributes,
+                           COALESCE(SCORE(name_tokens, @query), 0) + COALESCE(SCORE(summary_tokens, @query), 0) as score
+                    FROM EntityNode
+                    WHERE SEARCH(name_tokens, @query) OR SEARCH(summary_tokens, @query)
+                    ORDER BY score DESC, uuid
+                    LIMIT @inner_limit
+                ) AS n
+                {outer_where}
+                ORDER BY n.score DESC, n.uuid
+                LIMIT @limit
+            """
+            records, _, _ = await driver.execute_query(
+                spanner_query,
+                query=combined_query,
+                limit=total_limit,
+                inner_limit=inner_limit,
+                routing_='r',
+            )
+        
+        nodes = [get_entity_node_from_record(record, driver.provider) for record in records]
+        
+        logger.debug(
+            f'[BATCH_SEARCH] node_fulltext_search_batch: {len(clean_queries)} terms -> {len(nodes)} nodes '
+            f'(combined query: {combined_query[:100]}...)'
+        )
+        
+        return nodes
+    
+    else:
+        # For non-Spanner providers, fall back to individual searches
+        # This maintains compatibility but doesn't provide the optimization
+        logger.warning(
+            f'[BATCH_SEARCH] Batched search not optimized for provider {driver.provider}, '
+            f'falling back to individual searches'
+        )
+        all_nodes: list[EntityNode] = []
+        seen_uuids: set[str] = set()
+        
+        for query in clean_queries:
+            nodes = await node_fulltext_search(
+                driver=driver,
+                query=query,
+                search_filter=SearchFilters(),
+                group_ids=group_ids,
+                limit=limit_per_query,
+            )
+            for node in nodes:
+                if node.uuid not in seen_uuids:
+                    seen_uuids.add(node.uuid)
+                    all_nodes.append(node)
+        
+        return all_nodes[:total_limit]
 
 
 async def node_similarity_search(
@@ -1066,33 +1406,67 @@ async def node_similarity_search(
         # Then filter by similarity > min_score, which means distance < (1 - min_score)
         max_distance = 1.0 - min_score
 
-        query = f"""
-            WITH cosine_distance AS (
-                SELECT id, COSINE_DISTANCE(name_embedding, @search_vector) as distance 
+        # OPTIMIZATION: Filter by group_id FIRST to use the group_id index
+        # This enables Hybrid KNN - scanning only the partition (300-10K rows)
+        # instead of the entire table
+        if group_ids and len(group_ids) == 1:
+            # Single group_id: Most efficient - direct index lookup
+            query = """
+                SELECT uuid, name, group_id, created_at, summary, labels, attributes,
+                       (1.0 - COSINE_DISTANCE(name_embedding, @search_vector)) as score
                 FROM EntityNode
-            ), 
-            entity AS (
-                SELECT id, uuid, name, group_id, created_at, summary, labels, attributes 
-                FROM EntityNode
+                WHERE group_id = @group_id
+                  AND name_embedding IS NOT NULL
+                  AND COSINE_DISTANCE(name_embedding, @search_vector) < @max_distance
+                ORDER BY COSINE_DISTANCE(name_embedding, @search_vector) ASC
+                LIMIT @limit
+            """
+            records, _, _ = await driver.execute_query(
+                query,
+                search_vector=search_vector,
+                group_id=group_ids[0],
+                limit=limit,
+                max_distance=max_distance,
+                routing_='r',
             )
-            SELECT e.uuid, e.name, e.group_id, e.created_at, e.summary, e.labels, e.attributes,
-                   (1.0 - c.distance) as score
-            FROM entity e 
-            JOIN cosine_distance c ON c.id = e.id
-            WHERE c.distance < @max_distance
-            {filter_query}
-            ORDER BY c.distance ASC
-            LIMIT @limit
-        """
-
-        records, _, _ = await driver.execute_query(
-            query,
-            search_vector=search_vector,
-            limit=limit,
-            max_distance=max_distance,
-            routing_='r',
-            **filter_params,
-        )
+        elif group_ids and len(group_ids) > 1:
+            # Multiple group_ids: Use IN UNNEST for partition filtering
+            query = """
+                SELECT uuid, name, group_id, created_at, summary, labels, attributes,
+                       (1.0 - COSINE_DISTANCE(name_embedding, @search_vector)) as score
+                FROM EntityNode
+                WHERE group_id IN UNNEST(@group_ids)
+                  AND name_embedding IS NOT NULL
+                  AND COSINE_DISTANCE(name_embedding, @search_vector) < @max_distance
+                ORDER BY COSINE_DISTANCE(name_embedding, @search_vector) ASC
+                LIMIT @limit
+            """
+            records, _, _ = await driver.execute_query(
+                query,
+                search_vector=search_vector,
+                group_ids=group_ids,
+                limit=limit,
+                max_distance=max_distance,
+                routing_='r',
+            )
+        else:
+            # No group_id filter - fallback to scanning all (use with caution on large datasets)
+            query = """
+                SELECT uuid, name, group_id, created_at, summary, labels, attributes,
+                       (1.0 - COSINE_DISTANCE(name_embedding, @search_vector)) as score
+                FROM EntityNode
+                WHERE name_embedding IS NOT NULL
+                  AND COSINE_DISTANCE(name_embedding, @search_vector) < @max_distance
+                ORDER BY COSINE_DISTANCE(name_embedding, @search_vector) ASC
+                LIMIT @limit
+            """
+            records, _, _ = await driver.execute_query(
+                query,
+                search_vector=search_vector,
+                limit=limit,
+                max_distance=max_distance,
+                routing_='r',
+            )
 
     else:
         query = (

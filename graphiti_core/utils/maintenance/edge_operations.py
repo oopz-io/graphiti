@@ -40,6 +40,7 @@ from graphiti_core.search.search import search
 from graphiti_core.search.search_config import SearchResults
 from graphiti_core.search.search_config_recipes import EDGE_HYBRID_SEARCH_RRF
 from graphiti_core.search.search_filters import SearchFilters
+from graphiti_core.search.search_utils import edge_fulltext_search_batch
 from graphiti_core.utils.datetime_utils import ensure_utc, utc_now
 from graphiti_core.utils.maintenance.dedup_helpers import _normalize_string_exact
 
@@ -300,16 +301,20 @@ async def resolve_extracted_edges(
     logger.debug(f'[PROFILING] resolve_extracted_edges - Create embeddings: {embed_time:.2f}ms')
     step_start = time()
 
-    valid_edges_list: list[list[EntityEdge]] = await semaphore_gather(
-        *[
-            EntityEdge.get_between_nodes(driver, edge.source_node_uuid, edge.target_node_uuid)
-            for edge in extracted_edges
-        ]
-    )
+    # OPTIMIZATION: Use batched query to get all edges between node pairs in a single query
+    # This reduces N separate queries to 1 query
+    node_pairs = [(edge.source_node_uuid, edge.target_node_uuid) for edge in extracted_edges]
+    edges_by_pair = await EntityEdge.get_between_nodes_batch(driver, node_pairs)
+    
+    # Convert to list format matching the original structure
+    valid_edges_list: list[list[EntityEdge]] = [
+        edges_by_pair.get((edge.source_node_uuid, edge.target_node_uuid), [])
+        for edge in extracted_edges
+    ]
     get_edges_time = (time() - step_start) * 1000
     _profiling_data['resolve_extracted_edges']['get_existing_edges'] = get_edges_time
     logger.debug(
-        f'[PROFILING] resolve_extracted_edges - Get existing edges: {get_edges_time:.2f}ms'
+        f'[PROFILING] resolve_extracted_edges - Get existing edges (batched): {get_edges_time:.2f}ms'
     )
     step_start = time()
 
@@ -334,18 +339,54 @@ async def resolve_extracted_edges(
 
     related_edges_lists: list[list[EntityEdge]] = [result.edges for result in related_edges_results]
 
-    edge_invalidation_candidate_results: list[SearchResults] = await semaphore_gather(
-        *[
-            search(
-                clients,
-                extracted_edge.fact,
-                group_ids=[extracted_edge.group_id],
-                config=EDGE_HYBRID_SEARCH_RRF,
-                search_filter=SearchFilters(),
+    # OPTIMIZATION: Use batched search for invalidation candidates on Spanner
+    # This reduces N queries to 1 query since all edges have empty SearchFilters()
+    if driver.provider == GraphProvider.SPANNER and len(extracted_edges) > 1:
+        # Group edges by group_id
+        edges_by_group: dict[str, list[EntityEdge]] = {}
+        for edge in extracted_edges:
+            if edge.group_id not in edges_by_group:
+                edges_by_group[edge.group_id] = []
+            edges_by_group[edge.group_id].append(edge)
+        
+        # Batched search for each group
+        all_invalidation_candidates: list[EntityEdge] = []
+        for group_id, group_edges in edges_by_group.items():
+            facts = [edge.fact for edge in group_edges]
+            batch_results = await edge_fulltext_search_batch(
+                driver=driver,
+                queries=facts,
+                group_ids=[group_id],
+                limit_per_query=5,
             )
-            for extracted_edge in extracted_edges
+            all_invalidation_candidates.extend(batch_results)
+        
+        # Convert to the expected format (list of lists, one per extracted edge)
+        # Since we batched, each edge gets all candidates (they'll be deduplicated later)
+        edge_invalidation_candidates = [all_invalidation_candidates for _ in extracted_edges]
+        
+        logger.debug(
+            f'[BATCH_SEARCH] resolve_extracted_edges: batched {len(extracted_edges)} edge facts -> '
+            f'{len(all_invalidation_candidates)} invalidation candidates'
+        )
+    else:
+        # Original behavior for non-Spanner or single edge
+        edge_invalidation_candidate_results: list[SearchResults] = await semaphore_gather(
+            *[
+                search(
+                    clients,
+                    extracted_edge.fact,
+                    group_ids=[extracted_edge.group_id],
+                    config=EDGE_HYBRID_SEARCH_RRF,
+                    search_filter=SearchFilters(),
+                )
+                for extracted_edge in extracted_edges
+            ]
+        )
+        edge_invalidation_candidates = [
+            result.edges for result in edge_invalidation_candidate_results
         ]
-    )
+    
     search_invalidation_time = (time() - step_start) * 1000
     _profiling_data['resolve_extracted_edges']['search_invalidation_candidates'] = (
         search_invalidation_time
@@ -354,10 +395,6 @@ async def resolve_extracted_edges(
         f'[PROFILING] resolve_extracted_edges - Search invalidation candidates: {search_invalidation_time:.2f}ms'
     )
     step_start = time()
-
-    edge_invalidation_candidates: list[list[EntityEdge]] = [
-        result.edges for result in edge_invalidation_candidate_results
-    ]
 
     logger.debug(
         f'Related edges lists: {[(e.name, e.uuid) for edges_lst in related_edges_lists for e in edges_lst]}'

@@ -19,9 +19,24 @@ from graphiti_core.utils.contradicted_edges_utils import (
     get_contradiction_details,
     get_invalidating_edges_by_invalidated_uuids,
 )
+from graphiti_core.utils.query_profiler import (
+    enable_query_profiling,
+    disable_query_profiling,
+    get_query_profile,
+    print_query_profile_summary,
+    reset_query_profile,
+    is_profiling_enabled,
+)
 
 __all__ = [
     'get_invalidating_edges_by_invalidated_uuids',
     'get_all_contradictions_for_group',
     'get_contradiction_details',
+    # Query profiler
+    'enable_query_profiling',
+    'disable_query_profiling',
+    'get_query_profile',
+    'print_query_profile_summary',
+    'reset_query_profile',
+    'is_profiling_enabled',
 ]

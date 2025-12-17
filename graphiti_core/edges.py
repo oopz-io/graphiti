@@ -429,6 +429,106 @@ class EntityEdge(Edge):
         return edges
 
     @classmethod
+    async def get_between_nodes_batch(
+        cls,
+        driver: GraphDriver,
+        node_pairs: list[tuple[str, str]],
+    ) -> dict[tuple[str, str], list['EntityEdge']]:
+        """
+        Batch lookup of edges between multiple node pairs in a single query.
+        
+        This is an optimization that reduces N separate get_between_nodes calls
+        into a single database query, significantly reducing latency and CPU usage.
+        
+        Args:
+            driver: Graph database driver
+            node_pairs: List of (source_node_uuid, target_node_uuid) tuples
+            
+        Returns:
+            Dict mapping (source_uuid, target_uuid) -> list of edges between them
+        """
+        if not node_pairs:
+            return {}
+        
+        # Deduplicate pairs while preserving order for result mapping
+        unique_pairs = list(set(node_pairs))
+        
+        if driver.provider == GraphProvider.SPANNER:
+            # Build query with OR conditions for each pair
+            # This is more compatible with Spanner's parameter binding
+            if len(unique_pairs) == 1:
+                # Single pair - simple query
+                spanner_query = """
+                    SELECT uuid, name, fact, group_id, created_at, expired_at, 
+                           valid_at, invalid_at, source_node_uuid, target_node_uuid, 
+                           fact_embedding, episodes, attributes, labels
+                    FROM EntityEdge
+                    WHERE source_node_uuid = @src0 AND target_node_uuid = @tgt0
+                """
+                params = {'src0': unique_pairs[0][0], 'tgt0': unique_pairs[0][1]}
+            else:
+                # Multiple pairs - build OR conditions
+                # (source_node_uuid = @src0 AND target_node_uuid = @tgt0) OR (...)
+                conditions = []
+                params = {}
+                for i, (src, tgt) in enumerate(unique_pairs):
+                    conditions.append(f'(source_node_uuid = @src{i} AND target_node_uuid = @tgt{i})')
+                    params[f'src{i}'] = src
+                    params[f'tgt{i}'] = tgt
+                
+                where_clause = ' OR '.join(conditions)
+                spanner_query = f"""
+                    SELECT uuid, name, fact, group_id, created_at, expired_at, 
+                           valid_at, invalid_at, source_node_uuid, target_node_uuid, 
+                           fact_embedding, episodes, attributes, labels
+                    FROM EntityEdge
+                    WHERE {where_clause}
+                """
+            
+            records, _, _ = await driver.execute_query(
+                spanner_query,
+                routing_='r',
+                **params,
+            )
+        else:
+            # For Neo4j and other providers, use UNWIND with list of maps
+            if driver.provider == GraphProvider.KUZU:
+                match_query = """
+                    UNWIND $pairs AS pair
+                    MATCH (n:Entity {uuid: pair.source})
+                          -[:RELATES_TO]->(e:RelatesToNode_)
+                          -[:RELATES_TO]->(m:Entity {uuid: pair.target})
+                """
+            else:
+                match_query = """
+                    UNWIND $pairs AS pair
+                    MATCH (n:Entity {uuid: pair.source})-[e:RELATES_TO]->(m:Entity {uuid: pair.target})
+                """
+            
+            pairs_param = [{'source': p[0], 'target': p[1]} for p in unique_pairs]
+            
+            records, _, _ = await driver.execute_query(
+                match_query
+                + """
+                RETURN
+                """
+                + get_entity_edge_return_query(driver.provider),
+                pairs=pairs_param,
+                routing_='r',
+            )
+        
+        # Parse results and group by (source, target) pair
+        result: dict[tuple[str, str], list[EntityEdge]] = {pair: [] for pair in unique_pairs}
+        
+        for record in records:
+            edge = get_entity_edge_from_record(record, driver.provider)
+            key = (edge.source_node_uuid, edge.target_node_uuid)
+            if key in result:
+                result[key].append(edge)
+        
+        return result
+
+    @classmethod
     async def get_by_uuids(cls, driver: GraphDriver, uuids: list[str]):
         if len(uuids) == 0:
             return []
