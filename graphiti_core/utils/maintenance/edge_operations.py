@@ -40,7 +40,7 @@ from graphiti_core.search.search import search
 from graphiti_core.search.search_config import SearchResults
 from graphiti_core.search.search_config_recipes import EDGE_HYBRID_SEARCH_RRF
 from graphiti_core.search.search_filters import SearchFilters
-from graphiti_core.search.search_utils import edge_fulltext_search_batch
+from graphiti_core.search.search_utils import edge_fulltext_search_batch, edge_similarity_search_batch
 from graphiti_core.utils.datetime_utils import ensure_utc, utc_now
 from graphiti_core.utils.maintenance.dedup_helpers import _normalize_string_exact
 
@@ -318,18 +318,112 @@ async def resolve_extracted_edges(
     )
     step_start = time()
 
-    related_edges_results: list[SearchResults] = await semaphore_gather(
-        *[
-            search(
-                clients,
-                extracted_edge.fact,
-                group_ids=[extracted_edge.group_id],
-                config=EDGE_HYBRID_SEARCH_RRF,
-                search_filter=SearchFilters(edge_uuids=[edge.uuid for edge in valid_edges]),
-            )
-            for extracted_edge, valid_edges in zip(extracted_edges, valid_edges_list, strict=True)
+    # OPTIMIZATION: Use batched search for related edges on Spanner
+    # This reduces N BM25 queries + N similarity queries to just 2 batched queries
+    driver = clients.driver
+    if driver.provider == GraphProvider.SPANNER and len(extracted_edges) > 1:
+        from graphiti_core.search.search_utils import rrf
+
+        # Build exclusion sets for each extracted edge (edges to exclude from results)
+        exclusion_sets: list[set[str]] = [
+            {edge.uuid for edge in valid_edges}
+            for valid_edges in valid_edges_list
         ]
-    )
+
+        # Group edges by group_id for batched search
+        group_to_indices: dict[str, list[int]] = {}
+        for idx, edge in enumerate(extracted_edges):
+            if edge.group_id not in group_to_indices:
+                group_to_indices[edge.group_id] = []
+            group_to_indices[edge.group_id].append(idx)
+
+        # Prepare results structure
+        related_edges_lists: list[list[EntityEdge]] = [[] for _ in extracted_edges]
+
+        for group_id, indices in group_to_indices.items():
+            # Get facts and vectors for this group
+            facts = [extracted_edges[idx].fact for idx in indices]
+            vectors = [
+                extracted_edges[idx].fact_embedding
+                for idx in indices
+                if extracted_edges[idx].fact_embedding is not None
+            ]
+
+            # Batched BM25 search
+            bm25_results = await edge_fulltext_search_batch(
+                driver=driver,
+                queries=facts,
+                group_ids=[group_id],
+                limit_per_query=20,  # 2 * DEFAULT_SEARCH_LIMIT
+            )
+
+            # Batched similarity search (if we have embeddings)
+            if vectors:
+                sim_results = await edge_similarity_search_batch(
+                    driver=driver,
+                    search_vectors=vectors,
+                    group_ids=[group_id],
+                    limit_per_vector=20,  # 2 * DEFAULT_SEARCH_LIMIT
+                )
+            else:
+                sim_results = {}
+
+            # Build per-fact BM25 result lookup (dedup by fact+uuid)
+            fact_to_bm25_results: dict[str, list[EntityEdge]] = {fact: [] for fact in facts}
+            seen_per_fact: dict[str, set[str]] = {fact: set() for fact in facts}
+            for edge in bm25_results:
+                # BM25 results are pooled, need to check which facts could match
+                # For simplicity, include in all (RRF will handle ranking)
+                for fact in facts:
+                    if edge.uuid not in seen_per_fact[fact]:
+                        fact_to_bm25_results[fact].append(edge)
+                        seen_per_fact[fact].add(edge.uuid)
+
+            # Combine BM25 and similarity results using RRF for each extracted edge
+            for local_idx, global_idx in enumerate(indices):
+                fact = facts[local_idx]
+                exclusion_set = exclusion_sets[global_idx]
+
+                # Get BM25 results for this fact, excluding valid_edges
+                bm25_edges = [
+                    e for e in fact_to_bm25_results.get(fact, [])
+                    if e.uuid not in exclusion_set
+                ]
+
+                # Get similarity results for this index, excluding valid_edges
+                sim_edges_raw = sim_results.get(local_idx, [])
+                sim_edges = [e for e in sim_edges_raw if e.uuid not in exclusion_set]
+
+                # Apply RRF to combine results
+                bm25_uuids = [e.uuid for e in bm25_edges]
+                sim_uuids = [e.uuid for e in sim_edges]
+
+                if bm25_uuids or sim_uuids:
+                    edge_uuid_map = {e.uuid: e for e in bm25_edges + sim_edges}
+                    reranked_uuids, _ = rrf([bm25_uuids, sim_uuids])
+                    related_edges_lists[global_idx] = [
+                        edge_uuid_map[uuid] for uuid in reranked_uuids[:10]
+                    ]  # Apply limit
+
+        logger.debug(
+            f'[BATCH_SEARCH] resolve_extracted_edges: batched {len(extracted_edges)} related edge searches'
+        )
+    else:
+        # Original behavior for non-Spanner or single edge
+        related_edges_results: list[SearchResults] = await semaphore_gather(
+            *[
+                search(
+                    clients,
+                    extracted_edge.fact,
+                    group_ids=[extracted_edge.group_id],
+                    config=EDGE_HYBRID_SEARCH_RRF,
+                    search_filter=SearchFilters(edge_uuids=[edge.uuid for edge in valid_edges]),
+                )
+                for extracted_edge, valid_edges in zip(extracted_edges, valid_edges_list, strict=True)
+            ]
+        )
+        related_edges_lists = [result.edges for result in related_edges_results]
+
     search_related_time = (time() - step_start) * 1000
     _profiling_data['resolve_extracted_edges']['search_related_edges'] = search_related_time
     logger.debug(
@@ -337,37 +431,70 @@ async def resolve_extracted_edges(
     )
     step_start = time()
 
-    related_edges_lists: list[list[EntityEdge]] = [result.edges for result in related_edges_results]
-
     # OPTIMIZATION: Use batched search for invalidation candidates on Spanner
     # This reduces N queries to 1 query since all edges have empty SearchFilters()
     if driver.provider == GraphProvider.SPANNER and len(extracted_edges) > 1:
-        # Group edges by group_id
-        edges_by_group: dict[str, list[EntityEdge]] = {}
-        for edge in extracted_edges:
-            if edge.group_id not in edges_by_group:
-                edges_by_group[edge.group_id] = []
-            edges_by_group[edge.group_id].append(edge)
-        
-        # Batched search for each group
-        all_invalidation_candidates: list[EntityEdge] = []
-        for group_id, group_edges in edges_by_group.items():
-            facts = [edge.fact for edge in group_edges]
-            batch_results = await edge_fulltext_search_batch(
+        from graphiti_core.search.search_utils import rrf as rrf_func
+
+        # Group edges by group_id with their indices
+        group_to_indices: dict[str, list[int]] = {}
+        for idx, edge in enumerate(extracted_edges):
+            if edge.group_id not in group_to_indices:
+                group_to_indices[edge.group_id] = []
+            group_to_indices[edge.group_id].append(idx)
+
+        # Prepare results structure
+        edge_invalidation_candidates: list[list[EntityEdge]] = [[] for _ in extracted_edges]
+
+        for group_id, indices in group_to_indices.items():
+            # Get facts and vectors for this group
+            facts = [extracted_edges[idx].fact for idx in indices]
+            vectors = [
+                extracted_edges[idx].fact_embedding
+                for idx in indices
+                if extracted_edges[idx].fact_embedding is not None
+            ]
+
+            # Batched BM25 search
+            bm25_results = await edge_fulltext_search_batch(
                 driver=driver,
                 queries=facts,
                 group_ids=[group_id],
-                limit_per_query=5,
+                limit_per_query=10,  # 2 * limit for RRF
             )
-            all_invalidation_candidates.extend(batch_results)
-        
-        # Convert to the expected format (list of lists, one per extracted edge)
-        # Since we batched, each edge gets all candidates (they'll be deduplicated later)
-        edge_invalidation_candidates = [all_invalidation_candidates for _ in extracted_edges]
-        
+
+            # Batched similarity search (if we have embeddings)
+            if vectors:
+                sim_results = await edge_similarity_search_batch(
+                    driver=driver,
+                    search_vectors=vectors,
+                    group_ids=[group_id],
+                    limit_per_vector=10,  # 2 * limit for RRF
+                )
+            else:
+                sim_results = {}
+
+            # Build UUID to edge mapping
+            all_edges = list(bm25_results) + [e for edges in sim_results.values() for e in edges]
+            edge_uuid_map = {e.uuid: e for e in all_edges}
+
+            # Apply RRF for each extracted edge
+            for local_idx, global_idx in enumerate(indices):
+                # Get BM25 results (pooled)
+                bm25_uuids = [e.uuid for e in bm25_results]
+
+                # Get similarity results for this index
+                sim_edges = sim_results.get(local_idx, [])
+                sim_uuids = [e.uuid for e in sim_edges]
+
+                if bm25_uuids or sim_uuids:
+                    reranked_uuids, _ = rrf_func([bm25_uuids, sim_uuids])
+                    edge_invalidation_candidates[global_idx] = [
+                        edge_uuid_map[uuid] for uuid in reranked_uuids[:5]
+                    ]  # Apply limit
+
         logger.debug(
-            f'[BATCH_SEARCH] resolve_extracted_edges: batched {len(extracted_edges)} edge facts -> '
-            f'{len(all_invalidation_candidates)} invalidation candidates'
+            f'[BATCH_SEARCH] resolve_extracted_edges: batched {len(extracted_edges)} invalidation candidates'
         )
     else:
         # Original behavior for non-Spanner or single edge

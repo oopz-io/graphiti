@@ -780,6 +780,192 @@ async def edge_similarity_search(
     return edges
 
 
+async def edge_similarity_search_batch(
+    driver: GraphDriver,
+    search_vectors: list[list[float]],
+    group_ids: list[str] | None = None,
+    limit_per_vector: int = RELEVANT_SCHEMA_LIMIT,
+    min_score: float = DEFAULT_MIN_SCORE,
+) -> dict[int, list[EntityEdge]]:
+    """
+    Batch similarity search for edges using multiple search vectors.
+    
+    This is an optimization for Spanner that combines N similarity searches into
+    a single query, reducing N round-trips to 1.
+    
+    Args:
+        driver: Graph database driver
+        search_vectors: List of embedding vectors to search with
+        group_ids: Filter by group IDs (required for Hybrid KNN optimization)
+        limit_per_vector: Maximum results per search vector
+        min_score: Minimum similarity score threshold
+        
+    Returns:
+        Dictionary mapping vector index to list of matching edges
+    """
+    if not search_vectors:
+        return {}
+    
+    # For non-Spanner, fall back to individual searches
+    if driver.provider != GraphProvider.SPANNER:
+        logger.debug(
+            f'[BATCH_SIMILARITY] Falling back to individual searches for provider {driver.provider}'
+        )
+        results: dict[int, list[EntityEdge]] = {}
+        for i, search_vector in enumerate(search_vectors):
+            edges = await edge_similarity_search(
+                driver=driver,
+                search_vector=search_vector,
+                source_node_uuid=None,
+                target_node_uuid=None,
+                search_filter=SearchFilters(),
+                group_ids=group_ids,
+                limit=limit_per_vector,
+                min_score=min_score,
+            )
+            results[i] = edges
+        return results
+    
+    # Spanner optimization: batch all vectors into a single query
+    max_distance = 1.0 - min_score
+    
+    if not group_ids or len(group_ids) == 0:
+        logger.warning('[BATCH_SIMILARITY] No group_ids provided, falling back to individual searches')
+        results = {}
+        for i, search_vector in enumerate(search_vectors):
+            edges = await edge_similarity_search(
+                driver=driver,
+                search_vector=search_vector,
+                source_node_uuid=None,
+                target_node_uuid=None,
+                search_filter=SearchFilters(),
+                group_ids=group_ids,
+                limit=limit_per_vector,
+                min_score=min_score,
+            )
+            results[i] = edges
+        return results
+    
+    # Build the batch query with UNNEST for multiple vectors
+    # Strategy: Use a CTE to enumerate vectors, then join with edges
+    # This approach:
+    # 1. Creates a table of (vector_idx, vector) pairs
+    # 2. Cross-joins with edges in the partition
+    # 3. Computes cosine distance for each (vector, edge) pair
+    # 4. Returns results grouped by vector_idx with per-vector limit
+    
+    # For Spanner, we need to pass vectors as separate parameters since UNNEST of arrays 
+    # with FLOAT64[] elements is complex. Instead, we use UNION ALL approach for small batches
+    # or a single query with ROW_NUMBER() for larger batches.
+    
+    num_vectors = len(search_vectors)
+    
+    if num_vectors <= 10:
+        # For small batches, use UNION ALL approach (simpler, good for small N)
+        union_parts = []
+        params = {
+            'max_distance': max_distance,
+            'limit': limit_per_vector,
+        }
+        
+        if len(group_ids) == 1:
+            params['group_id'] = group_ids[0]
+            group_filter = 'group_id = @group_id'
+        else:
+            params['group_ids'] = group_ids
+            group_filter = 'group_id IN UNNEST(@group_ids)'
+        
+        for i, search_vector in enumerate(search_vectors):
+            params[f'vec_{i}'] = search_vector
+            union_parts.append(f"""
+                SELECT {i} AS vector_idx, uuid, source_node_uuid, target_node_uuid, group_id, 
+                       created_at, name, fact, episodes, expired_at, valid_at, invalid_at, attributes,
+                       (1.0 - COSINE_DISTANCE(fact_embedding, @vec_{i})) as score
+                FROM EntityEdge
+                WHERE {group_filter}
+                  AND fact_embedding IS NOT NULL
+                  AND COSINE_DISTANCE(fact_embedding, @vec_{i}) < @max_distance
+                ORDER BY COSINE_DISTANCE(fact_embedding, @vec_{i}) ASC
+                LIMIT @limit
+            """)
+        
+        query = ' UNION ALL '.join(union_parts) + ' ORDER BY vector_idx, score DESC'
+        
+        records, _, _ = await driver.execute_query(
+            query,
+            routing_='r',
+            **params,
+        )
+        
+    else:
+        # For larger batches, use a more scalable approach with numbered CTEs
+        # This avoids extremely long UNION ALL chains
+        logger.debug(f'[BATCH_SIMILARITY] Large batch ({num_vectors} vectors), using chunked approach')
+        
+        # Process in chunks of 10
+        all_records = []
+        chunk_size = 10
+        for chunk_start in range(0, num_vectors, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, num_vectors)
+            chunk_vectors = search_vectors[chunk_start:chunk_end]
+            
+            union_parts = []
+            params = {
+                'max_distance': max_distance,
+                'limit': limit_per_vector,
+            }
+            
+            if len(group_ids) == 1:
+                params['group_id'] = group_ids[0]
+                group_filter = 'group_id = @group_id'
+            else:
+                params['group_ids'] = group_ids
+                group_filter = 'group_id IN UNNEST(@group_ids)'
+            
+            for local_idx, search_vector in enumerate(chunk_vectors):
+                global_idx = chunk_start + local_idx
+                params[f'vec_{local_idx}'] = search_vector
+                union_parts.append(f"""
+                    SELECT {global_idx} AS vector_idx, uuid, source_node_uuid, target_node_uuid, group_id, 
+                           created_at, name, fact, episodes, expired_at, valid_at, invalid_at, attributes,
+                           (1.0 - COSINE_DISTANCE(fact_embedding, @vec_{local_idx})) as score
+                    FROM EntityEdge
+                    WHERE {group_filter}
+                      AND fact_embedding IS NOT NULL
+                      AND COSINE_DISTANCE(fact_embedding, @vec_{local_idx}) < @max_distance
+                    ORDER BY COSINE_DISTANCE(fact_embedding, @vec_{local_idx}) ASC
+                    LIMIT @limit
+                """)
+            
+            chunk_query = ' UNION ALL '.join(union_parts)
+            
+            chunk_records, _, _ = await driver.execute_query(
+                chunk_query,
+                routing_='r',
+                **params,
+            )
+            all_records.extend(chunk_records)
+        
+        records = all_records
+    
+    # Group results by vector_idx
+    results: dict[int, list[EntityEdge]] = {i: [] for i in range(num_vectors)}
+    for record in records:
+        vector_idx = record.get('vector_idx', 0)
+        if isinstance(vector_idx, str):
+            vector_idx = int(vector_idx)
+        edge = get_entity_edge_from_record(record, driver.provider)
+        if vector_idx in results:
+            results[vector_idx].append(edge)
+    
+    total_edges = sum(len(edges) for edges in results.values())
+    logger.debug(
+        f'[BATCH_SIMILARITY] edge_similarity_search_batch: {num_vectors} vectors -> {total_edges} edges'
+    )
+    
+    return results
+
+
 async def edge_bfs_search(
     driver: GraphDriver,
     bfs_origin_node_uuids: list[str] | None,
